@@ -99,6 +99,9 @@ func checkHashes(ctx context.Context, src fs.ObjectInfo, dst fs.Object, ht hash.
 		return nil
 	})
 	err = g.Wait()
+	if transferErr := fs.TransferError(ctx, nil); transferErr != nil {
+		return false, ht, srcHash, dstHash, fs.TransferError(ctx, err)
+	}
 	if err == errNoHash {
 		return true, hash.None, srcHash, dstHash, nil
 	}
@@ -745,6 +748,9 @@ func SameDir(fdst, fsrc fs.Info) bool {
 // Retry runs fn up to maxTries times if it returns a retriable error
 func Retry(ctx context.Context, o any, maxTries int, fn func() error) (err error) {
 	for tries := 1; tries <= maxTries; tries++ {
+		if err = fs.TransferError(ctx, nil); err != nil {
+			return err
+		}
 		// Call the function which might error
 		err = fn()
 		if err == nil {
@@ -760,12 +766,29 @@ func Retry(ctx context.Context, o any, maxTries int, fn func() error) (err error
 			continue
 		} else if t, ok := pacer.IsRetryAfter(err); ok {
 			fs.Debugf(o, "Sleeping for %v (as indicated by the server) to obey Retry-After error: %v", t, err)
-			time.Sleep(t)
+			if fs.HasTransferTimeout(ctx) {
+				if err := contextSleep(ctx, t); err != nil {
+					return fs.TransferError(ctx, err)
+				}
+			} else {
+				time.Sleep(t)
+			}
 			continue
 		}
 		break
 	}
 	return err
+}
+
+func contextSleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }
 
 // ListFn lists the Fs to the supplied function
@@ -1374,7 +1397,7 @@ func catObject(ctx context.Context, o fs.Object, w io.Writer, offset, count int6
 //
 // in is closed at the end of the transfer
 func Rcat(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadCloser, modTime time.Time, meta fs.Metadata) (dst fs.Object, err error) {
-	return rcatSrc(ctx, fdst, dstFileName, in, modTime, meta, nil)
+	return rcatSrc(ctx, fdst, dstFileName, in, modTime, meta, nil, nil)
 }
 
 // rcatSrc reads data from the Reader until EOF and uploads it to a file on remote
@@ -1382,7 +1405,7 @@ func Rcat(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadCloser,
 // in is closed at the end of the transfer
 //
 // Pass in fsrc if known or nil if not
-func rcatSrc(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadCloser, modTime time.Time, meta fs.Metadata, fsrc fs.Fs) (dst fs.Object, err error) {
+func rcatSrc(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadCloser, modTime time.Time, meta fs.Metadata, fsrc fs.Fs, tr *accounting.Transfer) (dst fs.Object, err error) {
 	if SkipDestructive(ctx, dstFileName, "upload from pipe") {
 		// prevents "broken pipe" errors
 		_, err = io.Copy(io.Discard, in)
@@ -1390,11 +1413,23 @@ func rcatSrc(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadClos
 	}
 
 	ci := fs.GetConfig(ctx)
-	tr := accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, -1, nil, fdst)
-	defer func() {
-		tr.Done(ctx, err)
-	}()
-	var streamIn io.Reader = tr.Account(ctx, in).WithBuffer()
+	if tr == nil {
+		tr = accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, -1, nil, fdst)
+		defer func() {
+			tr.Done(ctx, err)
+		}()
+	}
+	inAcc := tr.Account(ctx, in).WithBuffer()
+	if fs.HasTransferTimeout(ctx) {
+		defer func() {
+			closeErr := inAcc.Close()
+			if err == nil {
+				err = closeErr
+			}
+			err = fs.TransferError(ctx, err)
+		}()
+	}
+	var streamIn io.Reader = inAcc
 
 	readCounter := readers.NewCountingReader(streamIn)
 	var trackingIn io.Reader
@@ -1433,6 +1468,8 @@ func rcatSrc(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadClos
 	if n, err := io.ReadFull(trackingIn, buf); err == io.EOF || err == io.ErrUnexpectedEOF {
 		fileIsSmall = true
 		buf = buf[:n]
+	} else if err != nil && fs.HasTransferTimeout(ctx) {
+		return nil, err
 	}
 
 	// Read the data we have already read in buf and any further unread
@@ -1499,6 +1536,9 @@ func rcatSrc(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadClos
 	}
 	src := object.NewStaticObjectInfo(dstFileName, modTime, int64(readCounter.BytesRead()), false, sums, fdst).WithMetadata(meta)
 	if !equal(ctx, src, dst, opt) {
+		if transferErr := fs.TransferError(ctx, nil); transferErr != nil {
+			return dst, transferErr
+		}
 		err = fmt.Errorf("corrupted on transfer")
 		err = fs.CountError(ctx, err)
 		fs.Errorf(dst, "%v", err)

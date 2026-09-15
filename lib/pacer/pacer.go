@@ -2,6 +2,7 @@
 package pacer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -155,6 +156,13 @@ func (p *Pacer) ModifyCalculator(f func(Calculator)) {
 //
 // This waits for the pacer token
 func (p *Pacer) beginCall(limitConnections bool) {
+	_ = p.beginCallContext(context.Background(), limitConnections)
+}
+
+func (p *Pacer) beginCallContext(ctx context.Context, limitConnections bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// pacer starts with a token in and whenever we take one out
 	// XXX ms later we put another in.  We could do this with a
 	// Ticker more accurately, but then we'd have to work out how
@@ -165,7 +173,11 @@ func (p *Pacer) beginCall(limitConnections bool) {
 	p.mu.Unlock()
 
 	if sleepTime > 0 {
-		<-p.pacer
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.pacer:
+		}
 
 		// Re-read the sleep time as it may be stale
 		// after waiting for the pacer token
@@ -174,15 +186,19 @@ func (p *Pacer) beginCall(limitConnections bool) {
 		p.mu.Unlock()
 
 		// Restart the timer
-		go func(t time.Duration) {
-			time.Sleep(t)
+		time.AfterFunc(sleepTime, func() {
 			p.pacer <- struct{}{}
-		}(sleepTime)
+		})
 	}
 
 	if limitConnections {
-		<-p.connTokens
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.connTokens:
+		}
 	}
+	return nil
 }
 
 // endCall implements the pacing algorithm
@@ -220,7 +236,7 @@ func (p *Pacer) endCall(retry bool, err error, limitConnections bool) {
 func (p *Pacer) call(fn Paced, retries int) (err error) {
 	var retry bool
 	limitConnections := false
-	if p.maxConnections > 0 && !caller.Present("(*Pacer).call") {
+	if p.maxConnections > 0 && !caller.Present("(*Pacer).call") && !caller.Present("(*Pacer).callContext") {
 		limitConnections = true
 	}
 	for i := 1; i <= retries; i++ {
@@ -254,6 +270,41 @@ func (p *Pacer) Call(fn Paced) (err error) {
 // it to be retried
 func (p *Pacer) CallNoRetry(fn Paced) error {
 	return p.call(fn, 1)
+}
+
+func (p *Pacer) callContext(ctx context.Context, fn Paced, retries int) (err error) {
+	limitConnections := p.maxConnections > 0 && !caller.Present("(*Pacer).callContext") && !caller.Present("(*Pacer).call")
+	for i := 1; i <= retries; i++ {
+		if err = p.beginCallContext(ctx, limitConnections); err != nil {
+			return err
+		}
+		if err = ctx.Err(); err != nil {
+			if limitConnections {
+				p.connTokens <- struct{}{}
+			}
+			return err
+		}
+		var retry bool
+		retry, err = p.invoker(i, retries, fn)
+		p.endCall(retry, err, limitConnections)
+		if !retry || ctx.Err() != nil {
+			break
+		}
+	}
+	return err
+}
+
+// CallContext 在限速和重试之间响应 ctx 取消；fn 自身必须响应 ctx。
+func (p *Pacer) CallContext(ctx context.Context, fn Paced) error {
+	p.mu.Lock()
+	retries := p.retries
+	p.mu.Unlock()
+	return p.callContext(ctx, fn, retries)
+}
+
+// CallNoRetryContext 可取消地等待调用位置，只执行一次 fn。
+func (p *Pacer) CallNoRetryContext(ctx context.Context, fn Paced) error {
+	return p.callContext(ctx, fn, 1)
 }
 
 func invoke(try, tries int, f Paced) (bool, error) {

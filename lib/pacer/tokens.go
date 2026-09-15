@@ -2,6 +2,8 @@
 
 package pacer
 
+import "context"
+
 // TokenDispenser is for controlling concurrency
 type TokenDispenser struct {
 	tokens chan struct{}
@@ -22,6 +24,19 @@ func NewTokenDispenser(n int) *TokenDispenser {
 // Get gets a token from the pool - don't forget to return it with Put
 func (td *TokenDispenser) Get() {
 	<-td.tokens
+}
+
+// GetContext 可取消地获取 token；成功后调用者必须用 Put 归还。
+func (td *TokenDispenser) GetContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-td.tokens:
+		return nil
+	}
 }
 
 // Put returns a token

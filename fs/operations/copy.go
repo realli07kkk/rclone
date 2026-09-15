@@ -46,6 +46,8 @@ func (c *copy) removeFailedCopy(ctx context.Context, o fs.Object) {
 	if o == nil {
 		return
 	}
+	ctx, cancel := fs.TransferCleanupContext(ctx)
+	defer cancel()
 	fs.Infof(o, "Removing failed copy")
 	err := o.Remove(ctx)
 	if err != nil {
@@ -55,6 +57,8 @@ func (c *copy) removeFailedCopy(ctx context.Context, o fs.Object) {
 
 // Used to remove a failed partial copy
 func (c *copy) removeFailedPartialCopy(ctx context.Context, f fs.Fs, remote string) {
+	ctx, cancel := fs.TransferCleanupContext(ctx)
+	defer cancel()
 	o, err := f.NewObject(ctx, remote)
 	if errors.Is(err, fs.ErrorObjectNotFound) {
 		// Assume object has been deleted
@@ -200,7 +204,11 @@ func (c *copy) rcat(ctx context.Context, in io.ReadCloser) (actionTaken string, 
 	if !ok {
 		fsrc = nil
 	}
-	newDst, err = rcatSrc(ctx, c.f, c.remoteForCopy, in, c.src.ModTime(ctx), meta, fsrc)
+	var tr *accounting.Transfer
+	if fs.HasTransferTimeout(ctx) {
+		tr = c.tr
+	}
+	newDst, err = rcatSrc(ctx, c.f, c.remoteForCopy, in, c.src.ModTime(ctx), meta, fsrc, tr)
 	if c.doUpdate {
 		actionTaken = "Copied (Rcat, replaced existing)"
 	} else {
@@ -296,7 +304,10 @@ func (c *copy) verify(ctx context.Context, newDst fs.Object) (err error) {
 	// Verify hashes are the same after transfer - ignoring blank hashes
 	if c.hashType != hash.None {
 		// checkHashes has logs and counts errors
-		equal, _, srcSum, dstSum, _ := checkHashes(ctx, c.src, newDst, c.hashType)
+		equal, _, srcSum, dstSum, hashErr := checkHashes(ctx, c.src, newDst, c.hashType)
+		if err := fs.TransferError(ctx, nil); err != nil {
+			return fs.TransferError(ctx, hashErr)
+		}
 		if !equal {
 			return fmt.Errorf("corrupted on transfer: %v hashes differ src(%s) %q vs dst(%s) %q", c.hashType, c.src.Fs(), srcSum, newDst.Fs(), dstSum)
 		}
@@ -313,6 +324,9 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	var actionTaken string
 	retry := true
 	for tries := 0; retry && tries < c.maxTries; tries++ {
+		if err = fs.TransferError(ctx, nil); err != nil {
+			break
+		}
 		// Check we haven't hit any accounting limits
 		err = c.checkLimits(ctx)
 		if err != nil {
@@ -326,6 +340,7 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 		if errors.Is(err, fs.ErrorCantCopy) {
 			actionTaken, newDst, err = c.manualCopy(ctx)
 		}
+		err = fs.TransferError(ctx, err)
 
 		// End if ctx is in error
 		if fserrors.ContextError(ctx, &err) {
@@ -338,7 +353,14 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 			retry = true
 		} else if t, ok := pacer.IsRetryAfter(err); ok {
 			fs.Debugf(c.src, "Sleeping for %v (as indicated by the server) to obey Retry-After error: %v", t, err)
-			time.Sleep(t)
+			if fs.HasTransferTimeout(ctx) {
+				if sleepErr := contextSleep(ctx, t); sleepErr != nil {
+					err = fs.TransferError(ctx, sleepErr)
+					break
+				}
+			} else {
+				time.Sleep(t)
+			}
 			retry = true
 		}
 		if retry {
@@ -357,11 +379,13 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	}
 
 	// Verify the copy
-	err = c.verify(ctx, newDst)
+	err = fs.TransferError(ctx, c.verify(ctx, newDst))
 	if err != nil {
 		fs.Errorf(newDst, "%v", err)
 		err = fs.CountError(ctx, err)
-		c.removeFailedCopy(ctx, newDst)
+		if !fs.HasTransferTimeout(ctx) || (ctx.Err() == nil && !errors.Is(err, fs.ErrorTransferTimeout)) {
+			c.removeFailedCopy(ctx, newDst)
+		}
 		return nil, err
 	}
 
@@ -369,9 +393,12 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	if !c.inplace && c.remoteForCopy != c.remote {
 		movedNewDst, err := c.dstFeatures.Move(ctx, newDst, c.remote)
 		if err != nil {
+			err = fs.TransferError(ctx, err)
 			fs.Errorf(newDst, "partial file rename failed: %v", err)
 			err = fs.CountError(ctx, err)
-			c.removeFailedCopy(ctx, newDst)
+			if !fs.HasTransferTimeout(ctx) || (ctx.Err() == nil && !errors.Is(err, fs.ErrorTransferTimeout)) {
+				c.removeFailedCopy(ctx, newDst)
+			}
 			return nil, err
 		}
 		fs.Debugf(newDst, "renamed to: %s", c.remote)
@@ -379,6 +406,9 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	}
 
 	// Log what we have done
+	if err = fs.TransferError(ctx, nil); err != nil {
+		return newDst, err
+	}
 	if newDst != nil && c.src.String() != newDst.String() {
 		actionTaken = fmt.Sprintf("%s to: %s", actionTaken, newDst.String())
 	}
@@ -393,9 +423,16 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 // It returns the destination object if possible.  Note that this may
 // be nil.
 func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Object) (newDst fs.Object, err error) {
+	ctx, cancel := fs.WithTransferTimeout(ctx)
+	defer cancel()
 	ci := fs.GetConfig(ctx)
 	tr := accounting.Stats(ctx).NewTransfer(src, f)
 	defer func() {
+		err = fs.TransferError(ctx, err)
+		if err != nil && errors.Is(err, fs.ErrorTransferTimeout) && !fserrors.IsCounted(err) {
+			err = fs.CountError(ctx, err)
+			fs.Errorf(src, "Failed to copy: %v", err)
+		}
 		tr.Done(ctx, err)
 	}()
 	if SkipDestructive(ctx, src, "copy") {

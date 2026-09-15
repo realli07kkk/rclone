@@ -168,7 +168,9 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 			return
 		}
 		fs.Debugf(src, "multi-thread copy: cancelling transfer on exit")
-		abortErr := chunkWriter.Abort(ctx)
+		cleanupCtx, cleanupCancel := fs.TransferCleanupContext(ctx)
+		defer cleanupCancel()
+		abortErr := chunkWriter.Abort(cleanupCtx)
 		if abortErr != nil {
 			fs.Debugf(src, "multi-thread copy: abort failed: %v", abortErr)
 		}

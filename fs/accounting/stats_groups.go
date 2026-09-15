@@ -387,6 +387,7 @@ func (sg *statsGroups) sum(ctx context.Context) *StatsInfo {
 			}
 			sum.fatalError = sum.fatalError || stats.fatalError
 			sum.retryError = sum.retryError || stats.retryError
+			sum.transferTimeout = sum.transferTimeout || stats.transferTimeout
 			if stats.retryAfter.After(sum.retryAfter) {
 				// Update the retryAfter field only if it is a later date than the current one in the sum
 				sum.retryAfter = stats.retryAfter

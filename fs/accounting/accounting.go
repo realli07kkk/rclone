@@ -366,11 +366,21 @@ func (acc *Account) accountReadN(n int64) {
 }
 
 // Account the read and limit bandwidth
-func (acc *Account) accountRead(n int) {
+func (acc *Account) accountRead(n int) error {
 	acc.accountReadN(int64(n))
+	if fs.HasTransferTimeout(acc.ctx) {
+		if err := TokenBucket.limitBandwidthContext(acc.ctx, TokenBucketSlotAccounting, n); err != nil {
+			return err
+		}
+		acc.values.mu.Lock()
+		bucket := acc.tokenBucket[TokenBucketSlotAccounting]
+		acc.values.mu.Unlock()
+		return waitBandwidth(acc.ctx, bucket, n)
+	}
 
 	TokenBucket.LimitBandwidth(TokenBucketSlotAccounting, n)
 	acc.limitPerFileBandwidth(n)
+	return nil
 }
 
 // Account the read if not using network (eg for server side copies)
@@ -389,7 +399,9 @@ func (acc *Account) read(in io.Reader, p []byte) (n int, err error) {
 	bytesUntilLimit, err := acc.checkReadBefore()
 	if err == nil {
 		n, err = in.Read(p)
-		acc.accountRead(n)
+		if accountErr := acc.accountRead(n); accountErr != nil && (err == nil || err == io.EOF) {
+			err = accountErr
+		}
 		n, err = acc.checkReadAfter(bytesUntilLimit, n, err)
 	}
 	return n, err
@@ -451,7 +463,9 @@ func (acc AccountReaderAt) ReadAt(p []byte, off int64) (n int, err error) {
 	bytesUntilLimit, err := acc.checkReadBefore()
 	if err == nil {
 		n, err = acc.do.ReadAt(p, off)
-		acc.accountRead(n)
+		if accountErr := acc.accountRead(n); accountErr != nil && (err == nil || err == io.EOF) {
+			err = accountErr
+		}
 		n, err = acc.checkReadAfter(bytesUntilLimit, n, err)
 	}
 	return n, err
@@ -528,7 +542,9 @@ func (awt *accountWriteTo) Write(p []byte) (n int, err error) {
 		}
 		n, err = awt.w.Write(p)
 		n, err = awt.acc.checkReadAfter(bytesUntilLimit, n, err)
-		awt.acc.accountRead(n)
+		if accountErr := awt.acc.accountRead(n); accountErr != nil && err == nil {
+			err = accountErr
+		}
 		if truncated && err == nil {
 			err = ErrorMaxTransferLimitReachedFatal
 		}
@@ -559,7 +575,9 @@ func (acc *Account) AccountRead(n int) (err error) {
 	bytesUntilLimit, err := acc.checkReadBefore()
 	if err == nil {
 		n, err = acc.checkReadAfter(bytesUntilLimit, n, err)
-		acc.accountRead(n)
+		if accountErr := acc.accountRead(n); accountErr != nil && err == nil {
+			err = accountErr
+		}
 	}
 	return err
 }

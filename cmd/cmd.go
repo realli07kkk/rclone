@@ -268,6 +268,10 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 			fs.Errorf(nil, "Fatal error received - not attempting retries")
 			break
 		}
+		if accounting.GlobalStats().HadTransferTimeout() {
+			fs.Errorf(nil, "File transfer timeout received - current pass finished; preserving errors without high-level retries")
+			break
+		}
 		if accounting.GlobalStats().Errored() && !accounting.GlobalStats().HadRetryError() {
 			fs.Errorf(nil, "Can't retry any of the errors - not attempting retries")
 			break

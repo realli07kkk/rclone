@@ -363,6 +363,11 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Maximum duration rclone will transfer data for",
 	Groups:  "Copy",
 }, {
+	Name:    "transfer_timeout",
+	Default: Duration(0),
+	Help:    "Time limit per file copy including retries and verification (0 or off to disable); after a timeout finish the current pass without high-level retries",
+	Groups:  "Copy",
+}, {
 	Name:    "cutoff_mode",
 	Default: CutoffMode(0),
 	Help:    "Mode to stop transfers when reaching the max transfer limit HARD|SOFT|CAUTIOUS",
@@ -635,6 +640,7 @@ type ConfigInfo struct {
 	UseServerModTime           bool              `config:"use_server_modtime"`
 	MaxTransfer                SizeSuffix        `config:"max_transfer"`
 	MaxDuration                Duration          `config:"max_duration"`
+	TransferTimeout            Duration          `config:"transfer_timeout"`
 	CutoffMode                 CutoffMode        `config:"cutoff_mode"`
 	MaxBacklog                 int               `config:"max_backlog"`
 	MaxStatsGroups             int               `config:"max_stats_groups"`
@@ -699,6 +705,9 @@ var LogReload = func(*ConfigInfo) error { return nil }
 
 // Reload assumes the config has been edited and does what is necessary to make it live
 func (ci *ConfigInfo) Reload(ctx context.Context) error {
+	if ci.TransferTimeout < 0 {
+		return fmt.Errorf("--transfer-timeout must not be negative")
+	}
 	// Set -vv if --dump is in use
 	if ci.Dump != 0 && ci.LogLevel != LogLevelDebug {
 		Logf(nil, "Automatically setting -vv as --dump is enabled")

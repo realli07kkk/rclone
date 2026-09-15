@@ -39,6 +39,7 @@ type StatsInfo struct {
 	lastError             error
 	fatalError            bool
 	retryError            bool
+	transferTimeout       bool
 	retryAfter            time.Time
 	checks                int64
 	checking              *transferMap
@@ -730,6 +731,7 @@ func (s *StatsInfo) ResetCounters() {
 	s.lastError = nil
 	s.fatalError = false
 	s.retryError = false
+	s.transferTimeout = false
 	s.retryAfter = time.Time{}
 	s.checks = 0
 	s.transfers = 0
@@ -761,6 +763,7 @@ func (s *StatsInfo) ResetErrors() {
 	s.lastError = nil
 	s.fatalError = false
 	s.retryError = false
+	s.transferTimeout = false
 	s.retryAfter = time.Time{}
 }
 
@@ -779,6 +782,9 @@ func (s *StatsInfo) Error(err error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.errors++
+	if errors.Is(err, fs.ErrorTransferTimeout) {
+		s.transferTimeout = true
+	}
 	s.lastError = err
 	err = fserrors.FsError(err)
 	fserrors.Count(err)
@@ -795,6 +801,13 @@ func (s *StatsInfo) Error(err error) error {
 		s.retryError = true
 	}
 	return err
+}
+
+// HadTransferTimeout 报告本轮是否有对象超时，供整批结束后决定是否重试。
+func (s *StatsInfo) HadTransferTimeout() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.transferTimeout
 }
 
 // RetryAfter returns the time to retry after if it is set.  It will

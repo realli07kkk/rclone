@@ -129,6 +129,10 @@ func Open(ctx context.Context, src fs.Object, options ...fs.OpenOption) (rc *ReO
 //
 // we don't retry here as the Open() call will itself have low level retries
 func (h *ReOpen) open() error {
+	if fs.HasTransferTimeout(h.ctx) && h.ctx.Err() != nil {
+		h.err = h.ctx.Err()
+		return h.err
+	}
 	var opts []fs.OpenOption
 	if h.offset == 0 {
 		// if reading from the start using the initial options
@@ -186,6 +190,9 @@ func (h *ReOpen) accountRead(n int) error {
 func (h *ReOpen) Read(p []byte) (n int, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if fs.HasTransferTimeout(h.ctx) && h.ctx.Err() != nil {
+		h.err = h.ctx.Err()
+	}
 	if h.err != nil {
 		// return a previous error if there is one
 		return n, h.err
@@ -213,7 +220,7 @@ func (h *ReOpen) Read(p []byte) (n int, err error) {
 		h.offset += int64(nn)
 		if err != nil && err != io.EOF {
 			h.err = err
-			if !fserrors.IsNoLowLevelRetryError(err) {
+			if !fserrors.IsNoLowLevelRetryError(err) && !(fs.HasTransferTimeout(h.ctx) && h.ctx.Err() != nil) {
 				fs.Debugf(h.src, "Reopening on read failure after offset %d bytes: retry %d/%d: %v", h.offset, h.tries, h.maxTries, err)
 				if h.reopen() == nil {
 					err = nil

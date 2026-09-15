@@ -2906,6 +2906,37 @@ becomes idle for this long it is considered broken and disconnected.
 
 The default is `5m`.  Set to `0` to disable.
 
+### --transfer-timeout Duration
+
+Limit the total elapsed time for each file copy, including opening the
+source, reading data, uploading, internal retries, and verification. For
+example, `--transfer-timeout 2m` fails a file copy that takes more than two
+minutes even if data is still flowing. Queueing time is not included.
+Each file gets its own budget; retries within that copy do not reset it.
+
+The default is `0` (disabled). `off` also disables this option. Negative
+durations are rejected. This applies to file copies performed by `copy`,
+`copyto`, and `sync`, not listing, checking files before transfer, or
+standalone streaming commands such as `rcat`.
+
+When a file times out, rclone cancels its source and destination requests
+and waits for them to stop before transferring another file in that slot.
+Other files continue. Cancellation and cleanup may take additional time;
+remote cleanup requests share a separate budget of up to 30 seconds.
+Timely cancellation depends on the backend's support for context cancellation.
+
+After the current pass finishes, any file timeout prevents automatic
+high-level retries, including when other retryable errors occurred. The
+errors are retained and the command exits with a non-zero status. Without
+a file timeout, `--retries` works as usual. Use `--error` and `--log-file`
+to keep a record of failures for a later retry.
+
+A canceled upload may already have committed on the server. Rclone does
+not delete a final destination object merely because its verification timed
+out. With `--ignore-existing`, inspect these failed objects before retrying:
+an existing destination would otherwise be skipped. Failed multipart cleanup
+may require later cleanup or a bucket lifecycle rule.
+
 ### --transfers int
 
 The number of file transfers to run in parallel.  It can sometimes be

@@ -515,7 +515,9 @@ func (s *syncCopyMove) pairCopyOrMove(ctx context.Context, in *pipe, fdst fs.Fs,
 				err = operations.DeleteFile(ctx, src)
 			}
 		} else {
-			_, err = operations.Copy(ctx, fdst, dst, src.Remote(), src)
+			transferCtx, cancel := fs.WithTransferTimeout(ctx)
+			_, err = operations.Copy(transferCtx, fdst, dst, src.Remote(), src)
+			cancel()
 		}
 		s.processError(err)
 		if err != nil {

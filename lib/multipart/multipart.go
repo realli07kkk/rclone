@@ -47,20 +47,36 @@ func UploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.Reader, opt U
 
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	g, gCtx := errgroup.WithContext(uploadCtx)
 	defer atexit.OnError(&err, func() {
 		cancel()
 		if info.LeavePartsOnError {
 			return
 		}
 		fs.Debugf(src, "Cancelling multipart upload")
-		errCancel := chunkWriter.Abort(ctx)
+		cleanupCtx, cleanupCancel := fs.TransferCleanupContext(ctx)
+		defer cleanupCancel()
+		errCancel := chunkWriter.Abort(cleanupCtx)
 		if errCancel != nil {
-			fs.Debugf(src, "Failed to cancel multipart upload: %v", errCancel)
+			if fs.HasTransferTimeout(ctx) {
+				fs.Errorf(src, "Failed to cancel multipart upload: %v", errCancel)
+			} else {
+				fs.Debugf(src, "Failed to cancel multipart upload: %v", errCancel)
+			}
 		}
 	})()
+	if fs.HasTransferTimeout(ctx) {
+		defer func() {
+			if err != nil {
+				// 正常错误收尾先等待分片退出，再由前面的 defer 执行 Abort。
+				cancel()
+				_ = g.Wait()
+				err = fs.TransferError(ctx, err)
+			}
+		}()
+	}
 
 	var (
-		g, gCtx   = errgroup.WithContext(uploadCtx)
 		finished  = false
 		off       int64
 		size      = src.Size()
@@ -72,7 +88,13 @@ func UploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.Reader, opt U
 
 	for partNum := int64(0); !finished; partNum++ {
 		// Get a block of memory from the pool and token which limits concurrency.
-		tokens.Get()
+		if fs.HasTransferTimeout(ctx) {
+			if err = tokens.GetContext(gCtx); err != nil {
+				break
+			}
+		} else {
+			tokens.Get()
+		}
 		rw := NewRW().Reserve(chunkSize)
 		if acc != nil {
 			rw.SetAccounting(acc.AccountRead)
@@ -117,6 +139,9 @@ func UploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.Reader, opt U
 	}
 
 	err = g.Wait()
+	if err == nil && fs.HasTransferTimeout(ctx) {
+		err = ctx.Err()
+	}
 	if err != nil {
 		return nil, err
 	}

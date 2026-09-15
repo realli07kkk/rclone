@@ -186,6 +186,41 @@ func (tb *tokenBucket) LimitBandwidth(i TokenBucketSlot, n int) {
 	tb.mu.RUnlock()
 }
 
+func (tb *tokenBucket) limitBandwidthContext(ctx context.Context, i TokenBucketSlot, n int) error {
+	tb.mu.RLock()
+	bucket := tb.curr[i]
+	tb.mu.RUnlock()
+	return waitBandwidth(ctx, bucket, n)
+}
+
+// 等到实际取消而非预判 deadline 不足，避免提前误报对象超时。
+func waitBandwidth(ctx context.Context, bucket *rate.Limiter, n int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if bucket == nil || n == 0 {
+		return nil
+	}
+	now := time.Now()
+	reservation := bucket.ReserveN(now, n)
+	if !reservation.OK() {
+		return fmt.Errorf("bandwidth reservation of %d bytes exceeds burst %d", n, bucket.Burst())
+	}
+	timer := time.NewTimer(reservation.DelayFrom(now))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		reservation.CancelAt(time.Now())
+		return ctx.Err()
+	case <-timer.C:
+		if err := ctx.Err(); err != nil {
+			reservation.CancelAt(time.Now())
+			return err
+		}
+		return nil
+	}
+}
+
 // SetBwLimit sets the current bandwidth limit
 func (tb *tokenBucket) SetBwLimit(bandwidth fs.BwPair) {
 	tb.mu.Lock()

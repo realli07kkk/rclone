@@ -15,6 +15,22 @@ type Pacer struct {
 	*pacer.Pacer
 }
 
+// CallContext 为有单对象时限的复制提供可取消等待，其他调用保留原有行为。
+func (p *Pacer) CallContext(ctx context.Context, fn pacer.Paced) error {
+	if HasTransferTimeout(ctx) {
+		return p.Pacer.CallContext(ctx, fn)
+	}
+	return p.Call(fn)
+}
+
+// CallNoRetryContext 为有单对象时限的复制可取消地等待一次调用。
+func (p *Pacer) CallNoRetryContext(ctx context.Context, fn pacer.Paced) error {
+	if HasTransferTimeout(ctx) {
+		return p.Pacer.CallNoRetryContext(ctx, fn)
+	}
+	return p.CallNoRetry(fn)
+}
+
 type logCalculator struct {
 	pacer.Calculator
 }
