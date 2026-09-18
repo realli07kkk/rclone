@@ -238,7 +238,11 @@ func ShowStats() bool {
 
 // Run the function with stats and retries if required
 func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
-	ctx := context.Background()
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	shutdown := fs.GetGracefulShutdown(ctx)
 	ci := fs.GetConfig(ctx)
 	var cmdErr error
 	stopStats := func() {}
@@ -252,11 +256,20 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 	}
 	SigInfoHandler()
 	for try := 1; try <= ci.Retries; try++ {
+		if shutdown.Stopped() {
+			break
+		}
+		if try > 1 && shutdown != nil {
+			accounting.GlobalStats().ResetErrors()
+		}
 		cmdErr = f()
 		cmdErr = fs.CountError(ctx, cmdErr)
 		lastErr := accounting.GlobalStats().GetLastError()
 		if cmdErr == nil {
 			cmdErr = lastErr
+		}
+		if shutdown.Stopped() {
+			break
 		}
 		if !Retry || !accounting.GlobalStats().Errored() {
 			if try > 1 {
@@ -280,7 +293,7 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 			d := time.Until(retryAfter)
 			if d > 0 {
 				fs.Logf(nil, "Received retry after error - sleeping until %s (%v)", retryAfter.Format(time.RFC3339Nano), d)
-				time.Sleep(d)
+				retrySleep(shutdown, d)
 			}
 		}
 		if lastErr != nil {
@@ -288,11 +301,11 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 		} else {
 			fs.Errorf(nil, "Attempt %d/%d failed with %d errors", try, ci.Retries, accounting.GlobalStats().GetErrors())
 		}
-		if try < ci.Retries {
+		if try < ci.Retries && shutdown == nil {
 			accounting.GlobalStats().ResetErrors()
 		}
 		if ci.RetriesInterval > 0 {
-			time.Sleep(time.Duration(ci.RetriesInterval))
+			retrySleep(shutdown, time.Duration(ci.RetriesInterval))
 		}
 	}
 	stopStats()
@@ -489,6 +502,10 @@ func resolveExitCode(err error) {
 	ctx := context.Background()
 	ci := fs.GetConfig(ctx)
 	atexit.Run()
+	if code := atexit.SignalExitCode(); code != 0 {
+		fs.Logf(nil, "Graceful shutdown complete: active transfers and cleanup finished")
+		os.Exit(code)
+	}
 	if err == nil {
 		if ci.ErrorOnNoTransfer {
 			if accounting.GlobalStats().GetTransfers() == 0 {

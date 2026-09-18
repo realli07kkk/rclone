@@ -11,6 +11,8 @@ import (
 
 var exitSignals = []os.Signal{syscall.SIGINT, syscall.SIGTERM} // Not syscall.SIGQUIT as we want the default behaviour
 
+var terminateSignal os.Signal = syscall.SIGTERM
+
 // exitCode calculates the exit code for the given signal. Many Unix programs
 // exit with 128+signum if they handle signals. Most shell also implement the
 // same convention if a program is terminated by an uncaught and/or fatal

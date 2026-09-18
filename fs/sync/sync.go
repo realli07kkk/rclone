@@ -317,7 +317,7 @@ outer:
 
 // This checks the types of errors returned while copying files
 func (s *syncCopyMove) processError(err error) {
-	if err == nil {
+	if err == nil || fs.IsGracefulStop(s.inCtx, err) {
 		return
 	}
 	if err == context.DeadlineExceeded {
@@ -370,79 +370,104 @@ func (s *syncCopyMove) currentError() error {
 // FIXME potentially doing lots of hashes at once
 func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.WaitGroup) {
 	defer wg.Done()
+	checkCtx, cancel := fs.WithGracefulInput(s.ctx)
+	defer cancel()
 	for {
 		pair, ok := in.GetMax(s.inCtx, fraction)
-		if !ok {
+		if !ok || fs.GetGracefulShutdown(s.ctx).Stopped() {
 			return
 		}
+		ctx := checkCtx
 		src := pair.Src
 		var err error
-		tr := accounting.Stats(s.ctx).NewCheckingTransfer(src, "checking")
+		tr := accounting.Stats(ctx).NewCheckingTransfer(src, "checking")
 		// Check to see if can store this
 		if src.Storable() {
-			needTransfer := operations.NeedTransfer(s.ctx, pair.Dst, pair.Src)
+			var needTransfer, recheck bool
+			if fs.GetGracefulShutdown(ctx) != nil {
+				needTransfer, recheck = operations.NeedTransferWithDeferredModTime(ctx, pair.Dst, src)
+			} else {
+				needTransfer = operations.NeedTransfer(ctx, pair.Dst, src)
+			}
+			if fs.IsGracefulStop(ctx, ctx.Err()) {
+				tr.Done(ctx, nil)
+				return
+			}
 			if needTransfer {
-				NoNeedTransfer, err := operations.CompareOrCopyDest(s.ctx, s.fdst, pair.Dst, pair.Src, s.compareCopyDest, s.backupDir)
-				if err != nil {
+				NoNeedTransfer, err := operations.CompareOrCopyDest(ctx, s.fdst, pair.Dst, pair.Src, s.compareCopyDest, s.backupDir)
+				if err != nil && !fs.IsGracefulStop(ctx, err) {
 					s.processError(err)
-					s.logger(s.ctx, operations.TransferError, pair.Src, pair.Dst, err)
+					s.logger(ctx, operations.TransferError, pair.Src, pair.Dst, err)
 				}
 				if NoNeedTransfer {
 					needTransfer = false
 				}
 			}
+			if fs.GetGracefulShutdown(ctx).Stopped() {
+				tr.Done(ctx, nil)
+				return
+			}
 			// Fix case for case insensitive filesystems
 			if s.ci.FixCase && !s.ci.Immutable && pair.Dst != nil && src.Remote() != pair.Dst.Remote() {
-				// NeedTransfer's equality check may have deleted pair.Dst as a precursor
-				// to re-uploading it (the way modtime updates are done on backends like
-				// Dropbox that can't set modtime in place). If so, there is nothing to
-				// rename - nil out pair.Dst so the upload below recreates the file at
-				// src.Remote() (the correctly-cased name).
-				if needTransfer {
-					if _, statErr := s.fdst.NewObject(s.ctx, pair.Dst.Remote()); errors.Is(statErr, fs.ErrorObjectNotFound) {
-						fs.Debugf(pair.Dst, "Skipping fix-case rename: destination removed for re-upload, will recreate at %s", src.Remote())
-						pair.Dst = nil
+				if fs.GetGracefulShutdown(ctx) != nil {
+					needTransfer, recheck = true, true
+				} else {
+					// NeedTransfer's equality check may have deleted pair.Dst as a precursor
+					// to re-uploading it (the way modtime updates are done on backends like
+					// Dropbox that can't set modtime in place). If so, there is nothing to
+					// rename - nil out pair.Dst so the upload below recreates the file at
+					// src.Remote() (the correctly-cased name).
+					if needTransfer {
+						if _, statErr := s.fdst.NewObject(ctx, pair.Dst.Remote()); errors.Is(statErr, fs.ErrorObjectNotFound) {
+							fs.Debugf(pair.Dst, "Skipping fix-case rename: destination removed for re-upload, will recreate at %s", src.Remote())
+							pair.Dst = nil
+						}
 					}
-				}
-				if pair.Dst != nil {
-					if newDst, err := operations.Move(s.ctx, s.fdst, nil, src.Remote(), pair.Dst); err != nil {
-						fs.Errorf(pair.Dst, "Error while attempting to rename to %s: %v", src.Remote(), err)
-						s.processError(err)
-					} else {
-						fs.Infof(pair.Dst, "Fixed case by renaming to: %s", src.Remote())
-						pair.Dst = newDst
+					if pair.Dst != nil {
+						if newDst, err := operations.Move(ctx, s.fdst, nil, src.Remote(), pair.Dst); err != nil {
+							fs.Errorf(pair.Dst, "Error while attempting to rename to %s: %v", src.Remote(), err)
+							s.processError(err)
+						} else {
+							fs.Infof(pair.Dst, "Fixed case by renaming to: %s", src.Remote())
+							pair.Dst = newDst
+						}
 					}
 				}
 			}
 			if needTransfer {
 				// If files are treated as immutable, fail if destination exists and does not match
 				if s.ci.Immutable && pair.Dst != nil {
-					err := fs.CountError(s.ctx, fserrors.NoRetryError(fs.ErrorImmutableModified))
+					err := fs.CountError(ctx, fserrors.NoRetryError(fs.ErrorImmutableModified))
 					fs.Errorf(pair.Dst, "Source and destination exist but do not match: %v", err)
 					s.processError(err)
 				} else {
+					if recheck {
+						pair.Src = deferredCheckObject{src}
+					}
 					if pair.Dst != nil {
 						s.markDirModifiedObject(pair.Dst)
 					} else {
 						s.markDirModifiedObject(src)
 					}
 					// If destination already exists, then we must move it into --backup-dir if required
-					if pair.Dst != nil && s.backupDir != nil {
-						err := operations.MoveBackupDir(s.ctx, s.backupDir, pair.Dst)
+					if pair.Dst != nil && s.backupDir != nil && fs.GetGracefulShutdown(ctx) == nil {
+						err := operations.MoveBackupDir(ctx, s.backupDir, pair.Dst)
 						if err != nil {
 							s.processError(err)
-							s.logger(s.ctx, operations.TransferError, pair.Src, pair.Dst, err)
+							s.logger(ctx, operations.TransferError, pair.Src, pair.Dst, err)
 						} else {
 							// If successful zero out the dst as it is no longer there and copy the file
 							pair.Dst = nil
 							ok = out.Put(s.inCtx, pair)
 							if !ok {
+								tr.Done(ctx, nil)
 								return
 							}
 						}
 					} else {
 						ok = out.Put(s.inCtx, pair)
 						if !ok {
+							tr.Done(ctx, nil)
 							return
 						}
 					}
@@ -461,18 +486,61 @@ func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.W
 						// We send src == dst, to say we want the src deleted
 						ok = out.Put(s.inCtx, fs.ObjectPair{Src: src, Dst: src})
 						if !ok {
+							tr.Done(ctx, nil)
 							return
 						}
 					} else {
-						deleteFileErr := operations.DeleteFile(s.ctx, src)
+						deleteFileErr := operations.DeleteFile(ctx, src)
 						s.processError(deleteFileErr)
-						s.logger(s.ctx, operations.TransferError, pair.Src, pair.Dst, deleteFileErr)
+						s.logger(ctx, operations.TransferError, pair.Src, pair.Dst, deleteFileErr)
 					}
 				}
 			}
 		}
-		tr.Done(s.ctx, err)
+		tr.Done(ctx, err)
 	}
+}
+
+// deferredCheckObject keeps destination changes in the admitted transfer's lifetime.
+type deferredCheckObject struct{ fs.Object }
+
+func (s *syncCopyMove) copyWithDeferredCheck(ctx context.Context, fdst fs.Fs, dst, src fs.Object) (err error) {
+	ctx, cancel := fs.WithTransferTimeout(ctx)
+	defer cancel()
+	defer func() { err = fs.TransferError(ctx, err) }()
+	if pending, ok := src.(deferredCheckObject); ok {
+		src = pending.Object
+		needed := operations.NeedTransfer(ctx, dst, src)
+		if err := fs.TransferError(ctx, nil); err != nil {
+			return err
+		}
+		if s.ci.FixCase && !s.ci.Immutable && dst != nil && src.Remote() != dst.Remote() {
+			if needed {
+				if _, err := fdst.NewObject(ctx, dst.Remote()); errors.Is(err, fs.ErrorObjectNotFound) {
+					dst = nil
+				}
+			}
+			if dst != nil {
+				dst, err = operations.Move(ctx, fdst, nil, src.Remote(), dst)
+				if err != nil {
+					return err
+				}
+				fs.Infof(dst, "Fixed case by renaming to: %s", src.Remote())
+			}
+		}
+		if !needed {
+			return nil
+		}
+	}
+	// Keep backup and replacement in the same admitted object lifecycle.
+	if fs.GetGracefulShutdown(ctx) != nil && dst != nil && s.backupDir != nil {
+		if err = operations.MoveBackupDir(ctx, s.backupDir, dst); err != nil {
+			return err
+		}
+		dst = nil
+	}
+	_, err = operations.Copy(ctx, fdst, dst, src.Remote(), src)
+	return err
 }
 
 // pairRenamer reads Objects~s on in and attempts to rename them,
@@ -505,6 +573,10 @@ func (s *syncCopyMove) pairCopyOrMove(ctx context.Context, in *pipe, fdst fs.Fs,
 		if !ok {
 			return
 		}
+		transferCtx, admitted := fs.StartTransfer(ctx)
+		if !admitted {
+			return
+		}
 		src := pair.Src
 		dst := pair.Dst
 		if s.DoMove {
@@ -515,9 +587,7 @@ func (s *syncCopyMove) pairCopyOrMove(ctx context.Context, in *pipe, fdst fs.Fs,
 				err = operations.DeleteFile(ctx, src)
 			}
 		} else {
-			transferCtx, cancel := fs.WithTransferTimeout(ctx)
-			_, err = operations.Copy(transferCtx, fdst, dst, src.Remote(), src)
-			cancel()
+			err = s.copyWithDeferredCheck(transferCtx, fdst, dst, src)
 		}
 		s.processError(err)
 		if err != nil {
@@ -935,6 +1005,9 @@ func (s *syncCopyMove) tryRename(src fs.Object) bool {
 //
 // dir is the start directory, "" for root
 func (s *syncCopyMove) run() error {
+	var cancelInput context.CancelFunc
+	s.inCtx, cancelInput = fs.WithGracefulInput(s.inCtx)
+	defer cancelInput()
 	if operations.Same(s.fdst, s.fsrc) && !s.allowOverlap {
 		fs.Errorf(s.fdst, "Nothing to do as source and destination are the same")
 		return nil
@@ -1249,7 +1322,7 @@ func (s *syncCopyMove) setDelayedDirModTimes(ctx context.Context) error {
 
 // SrcOnly have an object which is in the source only
 func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
-	if s.deleteMode == fs.DeleteModeOnly {
+	if s.deleteMode == fs.DeleteModeOnly || fs.GetGracefulShutdown(s.ctx).Stopped() {
 		return false
 	}
 	switch x := src.(type) {
@@ -1266,10 +1339,16 @@ func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
 			}
 		} else {
 			// Check CompareDest && CopyDest
-			NoNeedTransfer, err := operations.CompareOrCopyDest(s.ctx, s.fdst, nil, x, s.compareCopyDest, s.backupDir)
-			if err != nil {
+			ctx := s.ctx
+			if len(s.compareCopyDest) != 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = fs.WithGracefulInput(ctx)
+				defer cancel()
+			}
+			NoNeedTransfer, err := operations.CompareOrCopyDest(ctx, s.fdst, nil, x, s.compareCopyDest, s.backupDir)
+			if err != nil && !fs.IsGracefulStop(ctx, err) {
 				s.processError(err)
-				s.logger(s.ctx, operations.TransferError, x, nil, err)
+				s.logger(ctx, operations.TransferError, x, nil, err)
 			}
 			if !NoNeedTransfer {
 				// No need to check since doesn't exist
@@ -1298,6 +1377,9 @@ func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
 
 // Match is called when src and dst are present, so sync src to dst
 func (s *syncCopyMove) Match(ctx context.Context, dst, src fs.DirEntry) (recurse bool) {
+	if fs.GetGracefulShutdown(s.ctx).Stopped() {
+		return false
+	}
 	switch srcX := src.(type) {
 	case fs.Object:
 		s.markParentNotEmpty(src)

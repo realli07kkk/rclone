@@ -423,6 +423,10 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 // It returns the destination object if possible.  Note that this may
 // be nil.
 func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Object) (newDst fs.Object, err error) {
+	ctx, admitted := fs.StartTransfer(ctx)
+	if !admitted {
+		return nil, nil
+	}
 	ctx, cancel := fs.WithTransferTimeout(ctx)
 	defer cancel()
 	ci := fs.GetConfig(ctx)
@@ -468,5 +472,9 @@ func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Obj
 
 // CopyFile moves a single file possibly to a new name
 func CopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string) (err error) {
+	ctx, admitted := fs.StartTransfer(ctx)
+	if !admitted {
+		return nil
+	}
 	return moveOrCopyFile(ctx, fdst, fsrc, dstFileName, srcFileName, true, false)
 }

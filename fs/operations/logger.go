@@ -160,6 +160,13 @@ func GetLogger(ctx context.Context) (LoggerFn, bool) {
 	logger, ok := ctx.Value(loggerKey).(LoggerFn)
 	if !ok {
 		logger = func(ctx context.Context, sigil Sigil, src, dst fs.DirEntry, err error) {}
+	} else if fs.GetGracefulShutdown(ctx) != nil {
+		original := logger
+		logger = func(ctx context.Context, sigil Sigil, src, dst fs.DirEntry, err error) {
+			if !fs.IsGracefulStop(ctx, err) {
+				original(ctx, sigil, src, dst, err)
+			}
+		}
 	}
 	return logger, ok
 }

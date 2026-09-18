@@ -46,6 +46,9 @@ func Start(ctx context.Context) {
 	// We can't do this in an init() method as it uses fs.Config
 	// and that isn't set up then.
 	fs.CountError = func(ctx context.Context, err error) error {
+		if fs.IsGracefulStop(ctx, err) {
+			return err
+		}
 		return Stats(ctx).Error(err)
 	}
 }

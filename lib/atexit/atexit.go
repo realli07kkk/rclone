@@ -21,6 +21,9 @@ var (
 	registerOnce sync.Once
 	signalled    atomic.Int32
 	runCalled    atomic.Int32
+	signalMutex  sync.Mutex
+	onTerminate  func() bool
+	signalCode   int
 )
 
 // FnHandle is the type of the handle returned by function `Register`
@@ -41,21 +44,52 @@ func Register(fn func()) FnHandle {
 	registerOnce.Do(func() {
 		exitChan = make(chan os.Signal, 1)
 		signal.Notify(exitChan, exitSignals...)
-		go func() {
-			sig := <-exitChan
-			if sig == nil {
-				return
+		go func(exitChan chan os.Signal) {
+			for sig := range exitChan {
+				signalled.Store(1)
+				signalMutex.Lock()
+				intercepted := sig == terminateSignal && onTerminate != nil && onTerminate()
+				if intercepted {
+					signalCode = exitCode(sig)
+				}
+				signalMutex.Unlock()
+				if intercepted {
+					continue
+				}
+				signal.Stop(exitChan)
+				fs.Infof(nil, "Signal received: %s", sig)
+				Run()
+				fs.Infof(nil, "Exiting...")
+				os.Exit(exitCode(sig))
 			}
-			signal.Stop(exitChan)
-			signalled.Store(1)
-			fs.Infof(nil, "Signal received: %s", sig)
-			Run()
-			fs.Infof(nil, "Exiting...")
-			os.Exit(exitCode(sig))
-		}()
+		}(exitChan)
 	})
 
 	return &fn
+}
+
+// OnTerminate installs an optional SIGTERM interceptor and returns its unregister function.
+// Returning true defers exit and cleanup; false runs the usual exit handlers.
+// The callback must return promptly and must not call OnTerminate or SignalExitCode.
+// Only one interceptor may be installed at a time.
+func OnTerminate(fn func() bool) func() {
+	signalMutex.Lock()
+	onTerminate = fn
+	signalMutex.Unlock()
+	handle := Register(func() {})
+	return func() {
+		signalMutex.Lock()
+		onTerminate = nil
+		signalMutex.Unlock()
+		Unregister(handle)
+	}
+}
+
+// SignalExitCode returns the exit code of an intercepted signal, or zero.
+func SignalExitCode() int {
+	signalMutex.Lock()
+	defer signalMutex.Unlock()
+	return signalCode
 }
 
 // Signalled returns true if an exit signal has been received

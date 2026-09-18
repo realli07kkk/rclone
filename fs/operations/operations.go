@@ -99,6 +99,9 @@ func checkHashes(ctx context.Context, src fs.ObjectInfo, dst fs.Object, ht hash.
 		return nil
 	})
 	err = g.Wait()
+	if fs.IsGracefulStop(ctx, err) && (srcErr == nil || fs.IsGracefulStop(ctx, srcErr)) && (dstErr == nil || fs.IsGracefulStop(ctx, dstErr)) {
+		return false, ht, srcHash, dstHash, err
+	}
 	if transferErr := fs.TransferError(ctx, nil); transferErr != nil {
 		return false, ht, srcHash, dstHash, fs.TransferError(ctx, err)
 	}
@@ -238,6 +241,7 @@ func logModTimeUpload(dst fs.Object) {
 type (
 	EqualFn           func(ctx context.Context, src fs.ObjectInfo, dst fs.Object) bool
 	equalFnContextKey struct{}
+	deferModTimeKey   struct{}
 )
 
 var equalFnKey = equalFnContextKey{}
@@ -322,6 +326,10 @@ func equal(ctx context.Context, src fs.ObjectInfo, dst fs.Object, opt equalOpt) 
 
 	// mod time differs but hash is the same to reset mod time if required
 	if opt.updateModTime {
+		if deferred, ok := ctx.Value(deferModTimeKey{}).(*bool); ok {
+			*deferred = true
+			return false
+		}
 		if !SkipDestructive(ctx, src, "update modification time") {
 			// Size and hash the same but mtime different
 			// Error if objects are treated as immutable
@@ -332,7 +340,9 @@ func equal(ctx context.Context, src fs.ObjectInfo, dst fs.Object, opt equalOpt) 
 			}
 			// Update the mtime of the dst object here
 			err := dst.SetModTime(ctx, srcModTime)
-			if errors.Is(err, fs.ErrorCantSetModTime) {
+			if fs.IsGracefulStop(ctx, err) {
+				return false
+			} else if errors.Is(err, fs.ErrorCantSetModTime) {
 				logModTimeUpload(dst)
 				fs.Infof(dst, "src and dst identical but can't set mod time without re-uploading")
 				logger(ctx, Differ, src, dst, nil)
@@ -1738,6 +1748,16 @@ func copyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CopyDest, bac
 	opt := defaultEqualOpt(ctx)
 	opt.updateModTime = false
 	if equal(ctx, src, CopyDestFile, opt) {
+		ctx, admitted := fs.StartTransfer(ctx)
+		if !admitted {
+			return true, nil
+		}
+		if fs.GetGracefulShutdown(ctx) != nil {
+			var cancel context.CancelFunc
+			ctx, cancel = fs.WithTransferTimeout(ctx)
+			defer cancel()
+			defer func() { err = fs.TransferError(ctx, err) }()
+		}
 		if dst == nil || !Equal(ctx, src, dst) {
 			if dst != nil && backupDir != nil {
 				err = MoveBackupDir(ctx, backupDir, dst)
@@ -1750,6 +1770,9 @@ func copyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CopyDest, bac
 			_, err := Copy(ctx, fdst, dst, remote, CopyDestFile)
 			if err != nil {
 				fs.Errorf(src, "Destination found in --copy-dest, error copying")
+				if fs.GetGracefulShutdown(ctx).Stopped() {
+					return true, err
+				}
 				return false, nil
 			}
 			fs.Debugf(src, "Destination found in --copy-dest, using server-side copy")
@@ -1859,6 +1882,15 @@ func NeedTransfer(ctx context.Context, dst, src fs.Object) bool {
 		}
 	}
 	return true
+}
+
+// NeedTransferWithDeferredModTime checks whether src needs copying, deferring
+// Equal's modification-time updates. If deferred is true, the caller must repeat
+// NeedTransfer before copying: updating the time may require deleting and re-uploading dst.
+func NeedTransferWithDeferredModTime(ctx context.Context, dst, src fs.Object) (needed, deferred bool) {
+	ctx = context.WithValue(ctx, deferModTimeKey{}, &deferred)
+	needed = NeedTransfer(ctx, dst, src)
+	return needed, deferred
 }
 
 // RcatSize reads data from the Reader until EOF and uploads it to a file on remote.
@@ -2202,6 +2234,9 @@ func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName str
 		}
 
 		_, err = Op(ctx, fdst, dstObj, dstFileName, srcObj)
+		if err != nil && fs.GetGracefulShutdown(ctx) != nil {
+			logger(ctx, TransferError, srcObj, dstObj, err)
+		}
 	} else if !cp {
 		if ci.IgnoreExisting {
 			fs.Debugf(srcObj, "Not removing source file as destination file exists and --ignore-existing is set")

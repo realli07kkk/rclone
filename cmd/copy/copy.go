@@ -2,7 +2,6 @@
 package copy
 
 import (
-	"context"
 	"strings"
 
 	"github.com/rclone/rclone/cmd"
@@ -15,6 +14,7 @@ import (
 
 var (
 	createEmptySrcDirs = false
+	gracefulShutdown   = false
 	loggerOpt          = operations.LoggerOpt{}
 	loggerFlagsOpt     = operationsflags.AddLoggerFlagsOptions{}
 )
@@ -23,6 +23,7 @@ func init() {
 	cmd.Root.AddCommand(commandDefinition)
 	cmdFlags := commandDefinition.Flags()
 	flags.BoolVarP(cmdFlags, &createEmptySrcDirs, "create-empty-src-dirs", "", createEmptySrcDirs, "Create empty source dirs on destination after copy", "")
+	flags.BoolVarP(cmdFlags, &gracefulShutdown, "graceful-shutdown", "", gracefulShutdown, "On SIGTERM, stop starting objects and let active transfers finish", "")
 	operationsflags.AddLoggerFlags(cmdFlags, &loggerOpt, &loggerFlagsOpt)
 	loggerOpt.LoggerFn = operations.NewDefaultLoggerFn(&loggerOpt)
 }
@@ -106,15 +107,41 @@ for more info.
 **Note**: Use the |--dry-run| or the |--interactive|/|-i| flag to test without
 copying anything.
 
+With |--graceful-shutdown|, the first SIGTERM stops scanning, checking and
+starting new objects. Queued objects are skipped. Active objects finish their
+transfers, verification and cleanup, then rclone prints statistics, closes
+reports and backends, and exits with code 143. A second SIGTERM uses the usual
+exit cleanup without waiting for transfers; Ctrl+C retains its usual behavior.
+This option is disabled by default and is available only for |copy|, including
+when its source is a single file.
+
+There is no shutdown grace deadline. Existing connection, idle I/O, backend
+and parent context timeouts still apply. |--transfer-timeout| retains each
+object's original deadline; |0| or |off| leaves it disabled. |--max-duration|
+retains the current pass's deadline: HARD cancels active transfers, while
+other cutoff modes stop starting new ones. Low-level retries, bandwidth and
+transfer limits remain in effect; high-level retries stop, including retry
+waits. Real failures remain in statistics and error reports, but an accepted
+SIGTERM always gives exit code 143.
+
+In particular, |--transfer-timeout 0 --timeout 30s| does not guarantee exit
+within 30 seconds of SIGTERM: a continuously flowing transfer can run until
+completion. Cleanup can take additional time; with an object timeout enabled,
+remote cleanup shares the existing budget of up to 30 seconds. Cancellation
+responsiveness depends on the backend.
+
 `, "|", "`") + operationsflags.Help(),
 	Annotations: map[string]string{
 		"groups": "Copy,Filter,Listing,Important",
 	},
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(2, 2, command, args)
+		if gracefulShutdown {
+			defer cmd.EnableGracefulShutdown(command)()
+		}
 		fsrc, srcFileName, fdst := cmd.NewFsSrcFileDst(args)
 		cmd.Run(true, true, command, func() error {
-			ctx := context.Background()
+			ctx := command.Context()
 			close, err := operationsflags.ConfigureLoggers(ctx, fdst, command, &loggerOpt, loggerFlagsOpt)
 			if err != nil {
 				return err

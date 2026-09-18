@@ -224,7 +224,7 @@ func (m *March) Run(ctx context.Context) error {
 						return
 					}
 					jobs, err := m.processJob(job)
-					if err != nil {
+					if err != nil && !fs.IsGracefulStop(m.Ctx, err) {
 						mu.Lock()
 						// Keep reference only to the first encountered error
 						if jobError == nil {
@@ -556,12 +556,27 @@ func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
 		}
 	})
 	if err != nil {
-		return nil, err
+		if fs.GetGracefulShutdown(m.Ctx) == nil {
+			return nil, err
+		}
+		// Drain both streams together so listing producers can finish before
+		// their backends are shut down, including the no-traverse pipeline.
+		dstCancel()
+		var drain sync.WaitGroup
+		drain.Go(func() {
+			for range srcChan {
+			}
+		})
+		drain.Go(func() {
+			for range dstChan {
+			}
+		})
+		drain.Wait()
 	}
 
 	// Wait for listings to complete and report errors
 	wg.Wait()
-	if srcListErr != nil {
+	if srcListErr != nil && !fs.IsGracefulStop(m.Ctx, srcListErr) {
 		if job.srcRemote != "" {
 			fs.Errorf(job.srcRemote, "error reading source directory: %v", srcListErr)
 		} else {
@@ -584,5 +599,5 @@ func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
 		return nil, dstListErr
 	}
 
-	return jobs, nil
+	return jobs, err
 }

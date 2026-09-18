@@ -10,6 +10,8 @@ import (
 
 var exitSignals = []os.Signal{os.Interrupt}
 
+var terminateSignal os.Signal
+
 func exitCode(_ os.Signal) int {
 	return exitcode.UncategorizedError
 }
