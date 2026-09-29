@@ -29,6 +29,11 @@ go build
 # Build with version info (preferred)
 make
 
+# Cross-compile a local binary (e.g. rclone-ea for Linux amd64)
+# Output path convention: dist/<goos>/<goarch>/<binary>
+# -s -w strips symbol table and DWARF to reduce size (~30%)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/linux/amd64/rclone-ea .
+
 # Run all unit tests (no cloud credentials needed)
 make quicktest
 # or equivalently:
@@ -57,6 +62,8 @@ cd fs/operations && go test -v -remote TestDrive:
 # Run integration tests via test framework
 go run ./fstest/test_all -backends drive
 ```
+
+Custom/local build outputs go into `dist/` (gitignored), not the repo root. Binaries are separated by target platform under `dist/<goos>/<goarch>/` (e.g. `dist/linux/amd64/rclone-ea`).
 
 ## Architecture
 
