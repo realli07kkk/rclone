@@ -9,6 +9,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -488,4 +489,84 @@ func TestRemoveDoneTransfers(t *testing.T) {
 	assert.Equal(t, time.Duration(transfers)*time.Second, s._totalDuration())
 	assert.Equal(t, transfers, len(s.startedTransfers))
 	s.mu.Unlock()
+}
+
+func TestNewLatencyStats(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		_, ok := newLatencyStats(nil)
+		assert.False(t, ok)
+	})
+
+	t.Run("Single", func(t *testing.T) {
+		ls, ok := newLatencyStats([]time.Duration{2 * time.Second})
+		assert.True(t, ok)
+		assert.Equal(t, latencyStats{
+			count:   1,
+			minimum: 2 * time.Second,
+			average: 2 * time.Second,
+			maximum: 2 * time.Second,
+			p95:     2 * time.Second,
+			p99:     2 * time.Second,
+		}, ls)
+	})
+
+	t.Run("Unsorted", func(t *testing.T) {
+		// durations 100ms..1ms in reverse order
+		durations := make([]time.Duration, 100)
+		for i := range durations {
+			durations[i] = time.Duration(100-i) * time.Millisecond
+		}
+		ls, ok := newLatencyStats(durations)
+		assert.True(t, ok)
+		assert.Equal(t, 100, ls.count)
+		assert.Equal(t, 1*time.Millisecond, ls.minimum)
+		assert.Equal(t, 50*time.Millisecond+500*time.Microsecond, ls.average) // 5050ms/100
+		assert.Equal(t, 100*time.Millisecond, ls.maximum)
+		assert.Equal(t, 95*time.Millisecond, ls.p95)
+		assert.Equal(t, 99*time.Millisecond, ls.p99)
+	})
+}
+
+func TestTransferLatency(t *testing.T) {
+	ctx := context.Background()
+	s := NewStats(ctx)
+
+	_, ok := s.transferLatency()
+	assert.False(t, ok)
+	assert.NotContains(t, s.String(), "Transfer times:")
+
+	// successful transfers are recorded
+	tr1 := s.NewTransferRemoteSize("potato", 0, nil, nil)
+	time.Sleep(2 * time.Millisecond)
+	tr1.Done(ctx, nil)
+
+	// failed transfers are not recorded
+	tr2 := s.NewTransferRemoteSize("sausage", 0, nil, nil)
+	tr2.Done(ctx, io.EOF)
+
+	ls, ok := s.transferLatency()
+	assert.True(t, ok)
+	assert.Equal(t, 1, ls.count)
+	assert.GreaterOrEqual(t, ls.minimum, 2*time.Millisecond)
+	assert.Equal(t, ls.minimum, ls.average)
+	assert.Equal(t, ls.minimum, ls.maximum)
+
+	// cached result is returned when no new durations were recorded
+	lsAgain, ok := s.transferLatency()
+	assert.True(t, ok)
+	assert.Equal(t, ls, lsAgain)
+
+	assert.Contains(t, s.String(), "Transfer times:")
+
+	rs, err := s.RemoteStats(false)
+	require.NoError(t, err)
+	require.Contains(t, rs, "transferTimes")
+	times, ok := rs["transferTimes"].(rc.Params)
+	require.True(t, ok)
+	assert.Equal(t, 1, times["count"])
+
+	s.ResetCounters()
+	_, ok = s.transferLatency()
+	assert.False(t, ok)
+	assert.NotContains(t, s.String(), "Transfer times:")
 }

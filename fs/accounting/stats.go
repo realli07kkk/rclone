@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -61,6 +62,9 @@ type StatsInfo struct {
 	startedTransfers      []*Transfer   // currently active transfers
 	oldTimeRanges         timeRanges    // a merged list of time ranges for the transfers
 	oldDuration           time.Duration // duration of transfers we have culled
+	transferDurations     []time.Duration
+	latency               latencyStats // cached stats over transferDurations
+	latencyComputed       int          // len(transferDurations) when latency was calculated
 	group                 string
 	startTime             time.Time // the moment these stats were initialized or reset
 	average               averageValues
@@ -115,6 +119,7 @@ func (s *StatsInfo) RemoteStats(short bool) (out rc.Params, err error) {
 	out = make(rc.Params)
 
 	ts := s.calculateTransferStats()
+	ls, lsOK := s.transferLatency()
 	out["totalChecks"] = ts.totalChecks
 	out["totalTransfers"] = ts.totalTransfers
 	out["totalBytes"] = ts.totalBytes
@@ -138,6 +143,16 @@ func (s *StatsInfo) RemoteStats(short bool) (out rc.Params, err error) {
 	out["serverSideCopyBytes"] = s.serverSideCopyBytes
 	out["serverSideMoves"] = s.serverSideMoves
 	out["serverSideMoveBytes"] = s.serverSideMoveBytes
+	if lsOK {
+		out["transferTimes"] = rc.Params{
+			"count": ls.count,
+			"min":   ls.minimum.Seconds(),
+			"avg":   ls.average.Seconds(),
+			"max":   ls.maximum.Seconds(),
+			"p95":   ls.p95.Seconds(),
+			"p99":   ls.p99.Seconds(),
+		}
+	}
 	eta, etaOK := eta(s.bytes, ts.totalBytes, ts.speed)
 	if etaOK {
 		out["eta"] = eta.Seconds()
@@ -308,6 +323,65 @@ func percent(a int64, b int64) string {
 	return fmt.Sprintf("%d%%", int(float64(a)*100/float64(b)+0.5))
 }
 
+// latencyStats summarises the durations of successful transfers
+type latencyStats struct {
+	count   int
+	minimum time.Duration
+	average time.Duration
+	maximum time.Duration
+	p95     time.Duration
+	p99     time.Duration
+}
+
+// newLatencyStats calculates latency stats for the durations using the
+// nearest-rank method for percentiles.
+//
+// Returns ok=false if durations is empty.
+func newLatencyStats(durations []time.Duration) (ls latencyStats, ok bool) {
+	if len(durations) == 0 {
+		return latencyStats{}, false
+	}
+	sorted := slices.Clone(durations)
+	slices.Sort(sorted)
+	var total time.Duration
+	for _, d := range sorted {
+		total += d
+	}
+	percentile := func(p float64) time.Duration {
+		// nearest-rank method: the ceil(p*n)-th smallest duration
+		i := int(math.Ceil(p*float64(len(sorted))/100)) - 1
+		if i < 0 {
+			i = 0
+		}
+		return sorted[i]
+	}
+	return latencyStats{
+		count:   len(sorted),
+		minimum: sorted[0],
+		average: total / time.Duration(len(sorted)),
+		maximum: sorted[len(sorted)-1],
+		p95:     percentile(95),
+		p99:     percentile(99),
+	}, true
+}
+
+// latencyString renders d for the latency stats line - durations below
+// 1ms would otherwise render as an empty string
+func latencyString(d time.Duration) string {
+	s := fs.Duration(d).ReadableString()
+	if s == "" {
+		return "0s"
+	}
+	return s
+}
+
+// String renders the latency stats for the stats output
+func (ls latencyStats) String() string {
+	return fmt.Sprintf("%9s min, %s avg, %s max, %s p95, %s p99",
+		latencyString(ls.minimum), latencyString(ls.average), latencyString(ls.maximum),
+		latencyString(ls.p95), latencyString(ls.p99))
+}
+
 // returned from calculateTransferStats
 type transferStats struct {
 	totalChecks    int64
@@ -415,6 +489,7 @@ func (s *StatsInfo) String() string {
 	// RemoteStats() too.
 
 	ts := s.calculateTransferStats()
+	ls, lsOK := s.transferLatency()
 
 	s.mu.RLock()
 
@@ -501,6 +576,9 @@ func (s *StatsInfo) String() string {
 		if s.transfers != 0 || ts.totalTransfers != 0 {
 			_, _ = fmt.Fprintf(buf, "Transferred:   %10d / %d, %s\n",
 				s.transfers, ts.totalTransfers, percent(s.transfers, ts.totalTransfers))
+		}
+		if lsOK {
+			_, _ = fmt.Fprintf(buf, "Transfer times:%s\n", ls)
 		}
 		if s.serverSideCopies != 0 || s.serverSideCopyBytes != 0 {
 			_, _ = fmt.Fprintf(buf, "Server Side Copies:%6d @ %s\n",
@@ -743,6 +821,9 @@ func (s *StatsInfo) ResetCounters() {
 	s.listed = 0
 	s.startedTransfers = nil
 	s.oldDuration = 0
+	s.transferDurations = nil
+	s.latency = latencyStats{}
+	s.latencyComputed = 0
 
 	// Only restart the average loop if it was running. Otherwise
 	// ResetCounters would spawn a goroutine that pins the StatsInfo,
@@ -893,6 +974,40 @@ func (s *StatsInfo) DoneTransferring(remote string, ok bool) {
 		s._stopAverageLoop()
 		s.mu.Unlock()
 	}
+}
+
+// AddTransferDuration records the duration of a successful transfer
+// so latency statistics can be shown in the stats output.
+func (s *StatsInfo) AddTransferDuration(d time.Duration) {
+	s.mu.Lock()
+	s.transferDurations = append(s.transferDurations, d)
+	s.mu.Unlock()
+}
+
+// transferLatency returns latency stats over the durations of the
+// successful transfers recorded so far, ok is false if there are none.
+//
+// The stats are cached and only recalculated when new durations were
+// recorded since the last call.
+func (s *StatsInfo) transferLatency() (latencyStats, bool) {
+	s.mu.RLock()
+	n := len(s.transferDurations)
+	if n == s.latencyComputed {
+		cached := s.latency
+		s.mu.RUnlock()
+		return cached, n > 0
+	}
+	durations := slices.Clone(s.transferDurations)
+	s.mu.RUnlock()
+
+	ls, ok := newLatencyStats(durations)
+
+	s.mu.Lock()
+	if len(s.transferDurations) == n {
+		s.latency, s.latencyComputed = ls, n
+	}
+	s.mu.Unlock()
+	return ls, ok
 }
 
 // SetCheckQueue sets the number of queued checks

@@ -1176,6 +1176,7 @@ Returns the following values:
 	"totalChecks": total number of checks in the group,
 	"totalTransfers": total number of transfers in the group,
 	"transferTime" : total time spent on running jobs,
+	"transferTimes": statistics (count, min, avg, max, p95, p99 in seconds) over the durations of successful transfers,
 	"transfers": number of transferred files,
 	"transferring": an array of currently active file transfers:
 		[

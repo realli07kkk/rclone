@@ -110,6 +110,7 @@ Returns the following values:
 	"totalChecks": total number of checks in the group,
 	"totalTransfers": total number of transfers in the group,
 	"transferTime" : total time spent on running jobs,
+	"transferTimes": statistics (count, min, avg, max, p95, p99 in seconds) over the durations of successful transfers,
 	"transfers": number of transferred files,
 	"updatedDirs": number of directories updated (modtime or metadata set),
 	"transferring": an array of currently active file transfers:
@@ -412,6 +413,7 @@ func (sg *statsGroups) sum(ctx context.Context) *StatsInfo {
 			sum.startedTransfers = append(sum.startedTransfers, stats.startedTransfers...)
 			sum.oldTimeRanges = append(sum.oldTimeRanges, stats.oldTimeRanges...)
 			sum.oldDuration += stats.oldDuration
+			sum.transferDurations = append(sum.transferDurations, stats.transferDurations...)
 			stats.average.mu.Lock()
 			sum.average.speed += stats.average.speed
 			stats.average.mu.Unlock()

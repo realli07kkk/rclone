@@ -139,6 +139,7 @@ func (tr *Transfer) Done(ctx context.Context, err error) {
 	if acc != nil {
 		tr.doneBytes = doneBytes
 	}
+	duration := tr.completedAt.Sub(tr.startedAt)
 	// free the account since we may keep the transfer
 	tr.acc = nil
 	tr.mu.Unlock()
@@ -147,6 +148,9 @@ func (tr *Transfer) Done(ctx context.Context, err error) {
 		tr.stats.DoneChecking(tr.remote)
 	} else {
 		tr.stats.DoneTransferring(tr.remote, err == nil)
+		if err == nil {
+			tr.stats.AddTransferDuration(duration)
+		}
 	}
 	tr.stats.PruneTransfers()
 }
