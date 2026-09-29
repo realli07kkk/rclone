@@ -62,9 +62,8 @@ type StatsInfo struct {
 	startedTransfers      []*Transfer   // currently active transfers
 	oldTimeRanges         timeRanges    // a merged list of time ranges for the transfers
 	oldDuration           time.Duration // duration of transfers we have culled
-	transferDurations     []time.Duration
-	latency               latencyStats // cached stats over transferDurations
-	latencyComputed       int          // len(transferDurations) when latency was calculated
+	transferTimes         durationStats // durations of successful transfers
+	headerTimes           durationStats // wait for response headers when opening the source of successful transfers
 	group                 string
 	startTime             time.Time // the moment these stats were initialized or reset
 	average               averageValues
@@ -120,6 +119,7 @@ func (s *StatsInfo) RemoteStats(short bool) (out rc.Params, err error) {
 
 	ts := s.calculateTransferStats()
 	ls, lsOK := s.transferLatency()
+	hs, hsOK := s.headerLatency()
 	out["totalChecks"] = ts.totalChecks
 	out["totalTransfers"] = ts.totalTransfers
 	out["totalBytes"] = ts.totalBytes
@@ -151,6 +151,16 @@ func (s *StatsInfo) RemoteStats(short bool) (out rc.Params, err error) {
 			"max":   ls.maximum.Seconds(),
 			"p95":   ls.p95.Seconds(),
 			"p99":   ls.p99.Seconds(),
+		}
+	}
+	if hsOK {
+		out["headerTimes"] = rc.Params{
+			"count": hs.count,
+			"min":   hs.minimum.Seconds(),
+			"avg":   hs.average.Seconds(),
+			"max":   hs.maximum.Seconds(),
+			"p95":   hs.p95.Seconds(),
+			"p99":   hs.p99.Seconds(),
 		}
 	}
 	eta, etaOK := eta(s.bytes, ts.totalBytes, ts.speed)
@@ -323,7 +333,8 @@ func percent(a int64, b int64) string {
 	return fmt.Sprintf("%d%%", int(float64(a)*100/float64(b)+0.5))
 }
 
-// latencyStats summarises the durations of successful transfers
+// latencyStats summarises a set of durations, e.g. the durations of
+// successful transfers or their waits for response headers
 type latencyStats struct {
 	count   int
 	minimum time.Duration
@@ -380,6 +391,32 @@ func (ls latencyStats) String() string {
 	return fmt.Sprintf("%9s min, %s avg, %s max, %s p95, %s p99",
 		latencyString(ls.minimum), latencyString(ls.average), latencyString(ls.maximum),
 		latencyString(ls.p95), latencyString(ls.p99))
+}
+
+// durationStats collects durations and caches the latency statistics
+// calculated over them. Callers must hold the lock of the StatsInfo it
+// belongs to while accessing it.
+type durationStats struct {
+	durations []time.Duration
+	cached    latencyStats // stats over durations, valid when computed == len(durations)
+	computed  int          // len(durations) when cached was calculated
+}
+
+// add records the duration d
+func (ds *durationStats) add(d time.Duration) {
+	ds.durations = append(ds.durations, d)
+}
+
+// reset clears the collected durations and the cached statistics
+func (ds *durationStats) reset() {
+	ds.durations = nil
+	ds.cached = latencyStats{}
+	ds.computed = 0
+}
+
+// merge appends the durations collected in other
+func (ds *durationStats) merge(other *durationStats) {
+	ds.durations = append(ds.durations, other.durations...)
 }
 
 // returned from calculateTransferStats
@@ -490,6 +527,7 @@ func (s *StatsInfo) String() string {
 
 	ts := s.calculateTransferStats()
 	ls, lsOK := s.transferLatency()
+	hs, hsOK := s.headerLatency()
 
 	s.mu.RLock()
 
@@ -579,6 +617,9 @@ func (s *StatsInfo) String() string {
 		}
 		if lsOK {
 			_, _ = fmt.Fprintf(buf, "Transfer times:%s\n", ls)
+		}
+		if hsOK {
+			_, _ = fmt.Fprintf(buf, "Header times:  %s\n", hs)
 		}
 		if s.serverSideCopies != 0 || s.serverSideCopyBytes != 0 {
 			_, _ = fmt.Fprintf(buf, "Server Side Copies:%6d @ %s\n",
@@ -821,9 +862,8 @@ func (s *StatsInfo) ResetCounters() {
 	s.listed = 0
 	s.startedTransfers = nil
 	s.oldDuration = 0
-	s.transferDurations = nil
-	s.latency = latencyStats{}
-	s.latencyComputed = 0
+	s.transferTimes.reset()
+	s.headerTimes.reset()
 
 	// Only restart the average loop if it was running. Otherwise
 	// ResetCounters would spawn a goroutine that pins the StatsInfo,
@@ -980,31 +1020,52 @@ func (s *StatsInfo) DoneTransferring(remote string, ok bool) {
 // so latency statistics can be shown in the stats output.
 func (s *StatsInfo) AddTransferDuration(d time.Duration) {
 	s.mu.Lock()
-	s.transferDurations = append(s.transferDurations, d)
+	s.transferTimes.add(d)
+	s.mu.Unlock()
+}
+
+// AddHeaderTime records how long a successful transfer waited for its
+// source to be opened so latency statistics can be shown in the stats
+// output.
+func (s *StatsInfo) AddHeaderTime(d time.Duration) {
+	s.mu.Lock()
+	s.headerTimes.add(d)
 	s.mu.Unlock()
 }
 
 // transferLatency returns latency stats over the durations of the
 // successful transfers recorded so far, ok is false if there are none.
+func (s *StatsInfo) transferLatency() (latencyStats, bool) {
+	return s.latencyOf(&s.transferTimes)
+}
+
+// headerLatency returns latency stats over the waits for response
+// headers recorded so far, ok is false if there are none.
+func (s *StatsInfo) headerLatency() (latencyStats, bool) {
+	return s.latencyOf(&s.headerTimes)
+}
+
+// latencyOf returns the cached latency stats over the durations
+// collected in ds, ok is false if there are none.
 //
 // The stats are cached and only recalculated when new durations were
-// recorded since the last call.
-func (s *StatsInfo) transferLatency() (latencyStats, bool) {
+// recorded since the last call. The lock is released while calculating.
+func (s *StatsInfo) latencyOf(ds *durationStats) (latencyStats, bool) {
 	s.mu.RLock()
-	n := len(s.transferDurations)
-	if n == s.latencyComputed {
-		cached := s.latency
+	n := len(ds.durations)
+	if n == ds.computed {
+		cached := ds.cached
 		s.mu.RUnlock()
 		return cached, n > 0
 	}
-	durations := slices.Clone(s.transferDurations)
+	durations := slices.Clone(ds.durations)
 	s.mu.RUnlock()
 
 	ls, ok := newLatencyStats(durations)
 
 	s.mu.Lock()
-	if len(s.transferDurations) == n {
-		s.latency, s.latencyComputed = ls, n
+	if len(ds.durations) == n {
+		ds.cached, ds.computed = ls, n
 	}
 	s.mu.Unlock()
 	return ls, ok

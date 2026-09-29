@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -569,4 +570,56 @@ func TestTransferLatency(t *testing.T) {
 	_, ok = s.transferLatency()
 	assert.False(t, ok)
 	assert.NotContains(t, s.String(), "Transfer times:")
+}
+
+func TestHeaderLatency(t *testing.T) {
+	ctx := context.Background()
+	s := NewStats(ctx)
+
+	_, ok := s.headerLatency()
+	assert.False(t, ok)
+	assert.NotContains(t, s.String(), "Header times:")
+
+	// successful transfers whose source was opened are recorded
+	tr1 := s.NewTransferRemoteSize("potato", 0, nil, nil)
+	time.Sleep(2 * time.Millisecond)
+	tr1.Account(ctx, io.NopCloser(strings.NewReader("potato")))
+	tr1.Done(ctx, nil)
+
+	// failed transfers are not recorded
+	tr2 := s.NewTransferRemoteSize("sausage", 0, nil, nil)
+	tr2.Account(ctx, io.NopCloser(strings.NewReader("sausage")))
+	tr2.Done(ctx, io.EOF)
+
+	// transfers whose source was never opened (e.g. server side copy
+	// or dry run) are not recorded
+	tr3 := s.NewTransferRemoteSize("bean", 0, nil, nil)
+	tr3.Account(ctx, nil)
+	tr3.Done(ctx, nil)
+
+	ls, ok := s.headerLatency()
+	assert.True(t, ok)
+	assert.Equal(t, 1, ls.count)
+	assert.GreaterOrEqual(t, ls.minimum, 2*time.Millisecond)
+	assert.Equal(t, ls.minimum, ls.average)
+	assert.Equal(t, ls.minimum, ls.maximum)
+
+	// cached result is returned when no new durations were recorded
+	lsAgain, ok := s.headerLatency()
+	assert.True(t, ok)
+	assert.Equal(t, ls, lsAgain)
+
+	assert.Contains(t, s.String(), "Header times:")
+
+	rs, err := s.RemoteStats(false)
+	require.NoError(t, err)
+	require.Contains(t, rs, "headerTimes")
+	times, ok := rs["headerTimes"].(rc.Params)
+	require.True(t, ok)
+	assert.Equal(t, 1, times["count"])
+
+	s.ResetCounters()
+	_, ok = s.headerLatency()
+	assert.False(t, ok)
+	assert.NotContains(t, s.String(), "Header times:")
 }

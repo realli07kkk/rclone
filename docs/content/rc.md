@@ -1163,6 +1163,7 @@ Returns the following values:
 	"errors": number of errors,
 	"eta": estimated time in seconds until the group completes,
 	"fatalError": boolean whether there has been at least one fatal error,
+	"headerTimes": statistics (count, min, avg, max, p95, p99 in seconds) over the waits for response headers when opening the source of successful transfers,
 	"lastError": last error string,
 	"renames" : number of files renamed,
 	"listed" : number of directory entries listed,

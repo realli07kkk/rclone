@@ -67,6 +67,7 @@ type Transfer struct {
 	err         error
 	completedAt time.Time
 	doneBytes   int64
+	openedAt    time.Time // time the source body was first opened; zero if never opened (e.g. server side copy or dry run)
 }
 
 // newCheckingTransfer instantiates new checking of the object.
@@ -140,6 +141,10 @@ func (tr *Transfer) Done(ctx context.Context, err error) {
 		tr.doneBytes = doneBytes
 	}
 	duration := tr.completedAt.Sub(tr.startedAt)
+	// wait for the source to be opened - for HTTP based remotes the
+	// response headers have been received by then
+	headerWait := tr.openedAt.Sub(tr.startedAt)
+	opened := !tr.openedAt.IsZero()
 	// free the account since we may keep the transfer
 	tr.acc = nil
 	tr.mu.Unlock()
@@ -150,6 +155,9 @@ func (tr *Transfer) Done(ctx context.Context, err error) {
 		tr.stats.DoneTransferring(tr.remote, err == nil)
 		if err == nil {
 			tr.stats.AddTransferDuration(duration)
+			if opened {
+				tr.stats.AddHeaderTime(headerWait)
+			}
 		}
 	}
 	tr.stats.PruneTransfers()
@@ -176,6 +184,11 @@ func (tr *Transfer) Account(ctx context.Context, in io.ReadCloser) *Account {
 	tr.mu.Lock()
 	if tr.acc == nil {
 		tr.acc = newAccountSizeName(ctx, tr.stats, in, tr.size, tr.remote)
+		if in != nil {
+			// the source has just been opened - for HTTP based
+			// remotes the response headers have been received
+			tr.openedAt = time.Now()
+		}
 	} else {
 		tr.acc.UpdateReader(ctx, in)
 	}

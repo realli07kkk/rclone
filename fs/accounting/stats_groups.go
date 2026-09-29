@@ -97,6 +97,7 @@ Returns the following values:
 	"errors": number of errors,
 	"eta": estimated time in seconds until the group completes,
 	"fatalError": boolean whether there has been at least one fatal error,
+	"headerTimes": statistics (count, min, avg, max, p95, p99 in seconds) over the waits for response headers when opening the source of successful transfers,
 	"lastError": last error string,
 	"renames" : number of files renamed,
 	"listed" : number of directory entries listed,
@@ -413,7 +414,8 @@ func (sg *statsGroups) sum(ctx context.Context) *StatsInfo {
 			sum.startedTransfers = append(sum.startedTransfers, stats.startedTransfers...)
 			sum.oldTimeRanges = append(sum.oldTimeRanges, stats.oldTimeRanges...)
 			sum.oldDuration += stats.oldDuration
-			sum.transferDurations = append(sum.transferDurations, stats.transferDurations...)
+			sum.transferTimes.merge(&stats.transferTimes)
+			sum.headerTimes.merge(&stats.headerTimes)
 			stats.average.mu.Lock()
 			sum.average.speed += stats.average.speed
 			stats.average.mu.Unlock()
