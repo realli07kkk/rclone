@@ -47,6 +47,8 @@ func (as TransferSnapshot) MarshalJSON() ([]byte, error) {
 // accounting functions.
 // Transfer needs to be closed on completion.
 type Transfer struct {
+	OpenStats
+
 	// these are initialised at creation and may be accessed without locking
 	stats     *StatsInfo
 	remote    string
@@ -67,7 +69,7 @@ type Transfer struct {
 	err         error
 	completedAt time.Time
 	doneBytes   int64
-	openedAt    time.Time // time the source body was first opened; zero if never opened (e.g. server side copy or dry run)
+	openReader  openDurationReader
 }
 
 // newCheckingTransfer instantiates new checking of the object.
@@ -134,6 +136,8 @@ func (tr *Transfer) Done(ctx context.Context, err error) {
 	if acc != nil {
 		doneBytes, _ = acc.progress()
 	}
+	tr.captureOpenDuration()
+	headerWait, opened := tr.OpenDuration()
 
 	tr.mu.Lock()
 	tr.completedAt = time.Now()
@@ -141,10 +145,6 @@ func (tr *Transfer) Done(ctx context.Context, err error) {
 		tr.doneBytes = doneBytes
 	}
 	duration := tr.completedAt.Sub(tr.startedAt)
-	// wait for the source to be opened - for HTTP based remotes the
-	// response headers have been received by then
-	headerWait := tr.openedAt.Sub(tr.startedAt)
-	opened := !tr.openedAt.IsZero()
 	// free the account since we may keep the transfer
 	tr.acc = nil
 	tr.mu.Unlock()
@@ -152,29 +152,41 @@ func (tr *Transfer) Done(ctx context.Context, err error) {
 	if tr.checking {
 		tr.stats.DoneChecking(tr.remote)
 	} else {
-		tr.stats.DoneTransferring(tr.remote, err == nil)
-		if err == nil {
-			tr.stats.AddTransferDuration(duration)
-			if opened {
-				tr.stats.AddHeaderTime(headerWait)
-			}
+		var headerDuration *time.Duration
+		if opened {
+			headerDuration = &headerWait
 		}
+		tr.stats.doneTransferring(tr.remote, err == nil, &duration, headerDuration)
 	}
 	tr.stats.PruneTransfers()
 }
 
 // Reset allows to switch the Account to another transfer method.
 func (tr *Transfer) Reset(ctx context.Context) {
-	tr.mu.RLock()
+	tr.mu.Lock()
 	acc := tr.acc
 	tr.acc = nil
-	tr.mu.RUnlock()
+	tr.mu.Unlock()
 	ci := fs.GetConfig(ctx)
 
 	if acc != nil {
 		acc.Done()
 		if err := acc.Close(); err != nil {
 			fs.LogLevelPrintf(ci.StatsLogLevel, nil, "can't close account: %+v\n", err)
+		}
+	}
+	tr.captureOpenDuration()
+}
+
+// captureOpenDuration 在 reader 关闭后读取计时，支持延迟打开及并行读取。
+func (tr *Transfer) captureOpenDuration() {
+	tr.mu.Lock()
+	r := tr.openReader
+	tr.openReader = nil
+	tr.mu.Unlock()
+	if r != nil {
+		if d, ok := r.OpenDuration(); ok {
+			tr.RecordOpenDuration(d)
 		}
 	}
 }
@@ -184,13 +196,11 @@ func (tr *Transfer) Account(ctx context.Context, in io.ReadCloser) *Account {
 	tr.mu.Lock()
 	if tr.acc == nil {
 		tr.acc = newAccountSizeName(ctx, tr.stats, in, tr.size, tr.remote)
-		if in != nil {
-			// the source has just been opened - for HTTP based
-			// remotes the response headers have been received
-			tr.openedAt = time.Now()
-		}
 	} else {
 		tr.acc.UpdateReader(ctx, in)
+	}
+	if tr.openReader == nil {
+		tr.openReader, _ = in.(openDurationReader)
 	}
 	tr.acc.checking = tr.checking
 	tr.mu.Unlock()

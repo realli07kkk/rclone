@@ -4,8 +4,10 @@ import (
 	"context"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/hash"
 )
 
@@ -14,6 +16,8 @@ import (
 //
 // An initialChunkSize of <= 0 will disable chunked reading.
 type sequential struct {
+	accounting.OpenStats
+
 	ctx              context.Context
 	mu               sync.Mutex    // protects following fields
 	o                fs.Object     // source to read from
@@ -199,6 +203,7 @@ func (cr *sequential) openRange() error {
 
 	var rc io.ReadCloser
 	var err error
+	start := time.Now()
 	if length <= 0 {
 		if offset == 0 {
 			rc, err = cr.o.Open(cr.ctx, &fs.HashesOption{Hashes: hash.Set(hash.None)})
@@ -211,6 +216,7 @@ func (cr *sequential) openRange() error {
 	if err != nil {
 		return err
 	}
+	cr.RecordOpenDuration(time.Since(start))
 	return cr.resetReader(rc, offset)
 }
 

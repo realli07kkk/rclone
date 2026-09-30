@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/fserrors"
 )
 
@@ -18,6 +20,8 @@ type AccountFn func(n int) error
 
 // ReOpen is a wrapper for an object reader which reopens the stream on error
 type ReOpen struct {
+	accounting.OpenStats
+
 	ctx         context.Context
 	mu          sync.Mutex      // mutex to protect the below
 	readAtMu    sync.Mutex      // mutex to serialize the ReadAt calls
@@ -149,7 +153,11 @@ func (h *ReOpen) open() error {
 	if h.tries > h.maxTries {
 		h.err = errTooManyTries
 	} else {
+		start := time.Now()
 		h.rc, h.err = h.src.Open(h.ctx, opts...)
+		if h.err == nil {
+			h.RecordOpenDuration(time.Since(start))
+		}
 	}
 	if h.err != nil {
 		if h.tries > 1 {

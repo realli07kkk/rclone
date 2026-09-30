@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -492,14 +496,21 @@ func TestRemoveDoneTransfers(t *testing.T) {
 	s.mu.Unlock()
 }
 
-func TestNewLatencyStats(t *testing.T) {
+func TestDurationStats(t *testing.T) {
+	summarize := func(durations []time.Duration) (latencyStats, bool) {
+		var ds durationStats
+		for _, d := range durations {
+			ds.add(d)
+		}
+		return ds.latency()
+	}
 	t.Run("Empty", func(t *testing.T) {
-		_, ok := newLatencyStats(nil)
+		_, ok := summarize(nil)
 		assert.False(t, ok)
 	})
 
 	t.Run("Single", func(t *testing.T) {
-		ls, ok := newLatencyStats([]time.Duration{2 * time.Second})
+		ls, ok := summarize([]time.Duration{2 * time.Second})
 		assert.True(t, ok)
 		assert.Equal(t, latencyStats{
 			count:   1,
@@ -517,14 +528,16 @@ func TestNewLatencyStats(t *testing.T) {
 		for i := range durations {
 			durations[i] = time.Duration(100-i) * time.Millisecond
 		}
-		ls, ok := newLatencyStats(durations)
+		ls, ok := summarize(durations)
 		assert.True(t, ok)
 		assert.Equal(t, 100, ls.count)
 		assert.Equal(t, 1*time.Millisecond, ls.minimum)
 		assert.Equal(t, 50*time.Millisecond+500*time.Microsecond, ls.average) // 5050ms/100
 		assert.Equal(t, 100*time.Millisecond, ls.maximum)
-		assert.Equal(t, 95*time.Millisecond, ls.p95)
-		assert.Equal(t, 99*time.Millisecond, ls.p99)
+		assert.GreaterOrEqual(t, ls.p95, 95*time.Millisecond)
+		assert.Less(t, ls.p95, 95*time.Millisecond*65/64)
+		assert.GreaterOrEqual(t, ls.p99, 99*time.Millisecond)
+		assert.Less(t, ls.p99, 99*time.Millisecond*65/64)
 	})
 }
 
@@ -552,7 +565,7 @@ func TestTransferLatency(t *testing.T) {
 	assert.Equal(t, ls.minimum, ls.average)
 	assert.Equal(t, ls.minimum, ls.maximum)
 
-	// cached result is returned when no new durations were recorded
+	// 没有新样本时结果保持不变。
 	lsAgain, ok := s.transferLatency()
 	assert.True(t, ok)
 	assert.Equal(t, ls, lsAgain)
@@ -582,13 +595,12 @@ func TestHeaderLatency(t *testing.T) {
 
 	// successful transfers whose source was opened are recorded
 	tr1 := s.NewTransferRemoteSize("potato", 0, nil, nil)
-	time.Sleep(2 * time.Millisecond)
-	tr1.Account(ctx, io.NopCloser(strings.NewReader("potato")))
+	tr1.Account(ctx, &timedSource{ReadCloser: io.NopCloser(strings.NewReader("potato")), duration: 2 * time.Millisecond, opened: true})
 	tr1.Done(ctx, nil)
 
 	// failed transfers are not recorded
 	tr2 := s.NewTransferRemoteSize("sausage", 0, nil, nil)
-	tr2.Account(ctx, io.NopCloser(strings.NewReader("sausage")))
+	tr2.Account(ctx, &timedSource{ReadCloser: io.NopCloser(strings.NewReader("sausage")), duration: time.Second, opened: true})
 	tr2.Done(ctx, io.EOF)
 
 	// transfers whose source was never opened (e.g. server side copy
@@ -604,7 +616,7 @@ func TestHeaderLatency(t *testing.T) {
 	assert.Equal(t, ls.minimum, ls.average)
 	assert.Equal(t, ls.minimum, ls.maximum)
 
-	// cached result is returned when no new durations were recorded
+	// 没有新样本时结果保持不变。
 	lsAgain, ok := s.headerLatency()
 	assert.True(t, ok)
 	assert.Equal(t, ls, lsAgain)
@@ -622,4 +634,168 @@ func TestHeaderLatency(t *testing.T) {
 	_, ok = s.headerLatency()
 	assert.False(t, ok)
 	assert.NotContains(t, s.String(), "Header times:")
+}
+
+type timedSource struct {
+	io.ReadCloser
+	duration time.Duration
+	opened   bool
+}
+
+func (r *timedSource) OpenDuration() (time.Duration, bool) {
+	return r.duration, r.opened
+}
+
+func TestTransferLatencyNested(t *testing.T) {
+	ctx := context.Background()
+	s := NewStats(ctx)
+	outer := s.NewTransferRemoteSize("nested", 0, nil, nil)
+	inner := s.NewTransferRemoteSize("nested", 0, nil, nil)
+	inner.Done(ctx, nil)
+	outer.Done(ctx, nil)
+	ls, ok := s.transferLatency()
+	require.True(t, ok)
+	assert.Equal(t, int(s.GetTransfers()), ls.count)
+	assert.Equal(t, 1, ls.count)
+}
+
+func TestHeaderLatencySourceTiming(t *testing.T) {
+	for _, lazy := range []bool{false, true} {
+		t.Run(fmt.Sprint(lazy), func(t *testing.T) {
+			ctx := context.Background()
+			s := NewStats(ctx)
+			r := &timedSource{ReadCloser: io.NopCloser(strings.NewReader("test")), duration: 100 * time.Millisecond, opened: !lazy}
+			tr := s.NewTransferRemoteSize("test", 4, nil, nil)
+			tr.Account(ctx, r)
+			r.opened = true
+			tr.Reset(ctx)
+			tr.Account(ctx, &timedSource{ReadCloser: io.NopCloser(strings.NewReader("test")), duration: time.Second, opened: true})
+			tr.Done(ctx, nil)
+			ls, ok := s.headerLatency()
+			require.True(t, ok)
+			assert.Equal(t, 1, ls.count)
+			assert.Equal(t, r.duration, ls.minimum)
+			assert.Equal(t, r.duration, ls.maximum)
+		})
+	}
+}
+
+func TestHeaderLatencyWithoutSourceTiming(t *testing.T) {
+	ctx := context.Background()
+	s := NewStats(ctx)
+	tr := s.NewTransferRemoteSize("pipe", 0, nil, nil)
+	tr.Account(ctx, io.NopCloser(strings.NewReader("test")))
+	tr.Done(ctx, nil)
+	_, ok := s.headerLatency()
+	assert.False(t, ok)
+}
+
+func TestDurationStatsBounded(t *testing.T) {
+	var ds durationStats
+	for i := range 100_000 {
+		ds.add(time.Duration(i) * time.Millisecond)
+	}
+	assert.LessOrEqual(t, cap(ds.buckets), 4096)
+	ls, ok := ds.latency()
+	require.True(t, ok)
+	assert.Equal(t, 100_000, ls.count)
+	assert.Equal(t, 99_999*time.Millisecond/2, ls.average)
+}
+
+func TestDurationStatsMergeAndRange(t *testing.T) {
+	var whole, left, right durationStats
+	rng := rand.New(rand.NewSource(1))
+	durations := []time.Duration{0, 1, 63, 64, 127, 128, 255, 256, math.MaxInt64}
+	for range 10_000 {
+		durations = append(durations, time.Duration(rng.Int63()))
+	}
+	for i, d := range durations {
+		whole.add(d)
+		if i%2 == 0 {
+			left.add(d)
+		} else {
+			right.add(d)
+		}
+	}
+	left.merge(&right)
+	want, _ := whole.latency()
+	slices.Sort(durations)
+	for p, got := range map[int]time.Duration{95: want.p95, 99: want.p99} {
+		exact := durations[(p*len(durations)+99)/100-1]
+		assert.GreaterOrEqual(t, got, exact)
+		assert.LessOrEqual(t, got-exact, exact/64)
+	}
+	got, ok := left.latency()
+	require.True(t, ok)
+	assert.Equal(t, want, got)
+	right.reset()
+	got, _ = left.latency()
+	assert.Equal(t, want, got)
+	assert.LessOrEqual(t, cap(whole.buckets), 4096)
+
+	var large durationStats
+	large.add(math.MaxInt64)
+	large.add(math.MaxInt64)
+	large.add(math.MaxInt64)
+	ls, _ := large.latency()
+	assert.Equal(t, time.Duration(math.MaxInt64), ls.average)
+	assert.Equal(t, ls.maximum, ls.p99)
+
+	for _, d := range durations {
+		var ds durationStats
+		// 加入更大的样本，避免 maximum 截断掩盖桶上界的误差。
+		for range 100 {
+			ds.add(d)
+		}
+		ds.add(math.MaxInt64)
+		ls, _ := ds.latency()
+		assert.GreaterOrEqual(t, ls.p95, d)
+		assert.LessOrEqual(t, ls.p95-d, d/64)
+		assert.GreaterOrEqual(t, ls.p99, d)
+		assert.LessOrEqual(t, ls.p99-d, d/64)
+	}
+}
+
+func TestLatencyConcurrentReset(t *testing.T) {
+	s := NewStats(context.Background())
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for range 1000 {
+				s.transferLatency()
+				s.headerLatency()
+			}
+		})
+	}
+	for range 1000 {
+		s.ResetCounters()
+		s.AddTransferDuration(time.Second)
+		s.AddHeaderTime(time.Millisecond)
+	}
+	wg.Wait()
+	s.ResetCounters()
+	s.AddTransferDuration(2 * time.Second)
+	s.AddHeaderTime(2 * time.Millisecond)
+	ls, _ := s.transferLatency()
+	hs, _ := s.headerLatency()
+	assert.Equal(t, 1, ls.count)
+	assert.Equal(t, 2*time.Second, ls.average)
+	assert.Equal(t, 1, hs.count)
+	assert.Equal(t, 2*time.Millisecond, hs.average)
+}
+
+func BenchmarkDurationStats(b *testing.B) {
+	for _, count := range []int{100, 1_000_000} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			var ds durationStats
+			for range count {
+				ds.add(time.Second)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				ds.latency()
+			}
+		})
+	}
 }

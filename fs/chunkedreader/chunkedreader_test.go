@@ -6,7 +6,11 @@ import (
 	"io"
 	"math/rand"
 	"testing"
+	"time"
 
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/stretchr/testify/assert"
@@ -42,6 +46,47 @@ func TestChunkedReader(t *testing.T) {
 		cr := New(ctx, o, test.initialChunkSize, test.maxChunkSize, test.streams)
 		assert.IsType(t, test.crType, cr, what)
 		require.NoError(t, cr.Close(), what)
+	}
+}
+
+type delayedOpenObject struct {
+	fs.Object
+	delay time.Duration
+}
+
+func (o delayedOpenObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	time.Sleep(o.delay)
+	return o.Object.Open(ctx, options...)
+}
+
+func TestChunkedReaderHeaderTiming(t *testing.T) {
+	for _, streams := range []int{1, 2} {
+		for _, eager := range []bool{false, true} {
+			t.Run(fmt.Sprintf("streams=%d,eager=%v", streams, eager), func(t *testing.T) {
+				ctx := context.Background()
+				src := delayedOpenObject{
+					Object: mockobject.New("timed").WithContent([]byte("abcdef"), mockobject.SeekModeNone),
+					delay:  5 * time.Millisecond,
+				}
+				in := New(ctx, src, 2, 2, streams)
+				if eager {
+					_, err := in.Open()
+					require.NoError(t, err)
+				}
+				s := accounting.NewStats(ctx)
+				tr := s.NewTransfer(src, nil)
+				body, err := io.ReadAll(tr.Account(ctx, in))
+				tr.Done(ctx, err)
+				require.NoError(t, err)
+				assert.Equal(t, "abcdef", string(body))
+				stats, err := s.RemoteStats(false)
+				require.NoError(t, err)
+				require.Contains(t, stats, "headerTimes")
+				times := stats["headerTimes"].(rc.Params)
+				assert.Equal(t, 1, times["count"])
+				assert.GreaterOrEqual(t, times["min"].(float64), src.delay.Seconds())
+			})
+		}
 	}
 }
 

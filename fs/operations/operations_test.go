@@ -42,6 +42,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
 	"github.com/rclone/rclone/lib/pacer"
@@ -980,6 +981,28 @@ func TestMoveFile(t *testing.T) {
 	require.NoError(t, err)
 	r.CheckLocalItems(t)
 	r.CheckRemoteItems(t, file2)
+}
+
+func TestMoveTransferLatency(t *testing.T) {
+	ctx := context.Background()
+	r := fstest.NewRun(t)
+	file := r.WriteFile("timed-move", "contents", t1)
+	src, err := r.Flocal.NewObject(ctx, file.Path)
+	require.NoError(t, err)
+	features := r.Fremote.Features()
+	move := features.Move
+	features.Move = nil
+	defer func() { features.Move = move }()
+	accounting.GlobalStats().ResetCounters()
+	_, err = operations.MoveTransfer(ctx, r.Fremote, nil, file.Path, src)
+	require.NoError(t, err)
+	r.CheckLocalItems(t)
+	r.CheckRemoteItems(t, file)
+	stats, err := accounting.GlobalStats().RemoteStats(false)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stats["transfers"])
+	require.Contains(t, stats, "transferTimes")
+	assert.Equal(t, 1, stats["transferTimes"].(rc.Params)["count"])
 }
 
 func TestMoveFileWithIgnoreExisting(t *testing.T) {

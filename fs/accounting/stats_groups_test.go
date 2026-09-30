@@ -231,6 +231,36 @@ func TestStatsGroupOperations(t *testing.T) {
 	})
 }
 
+func TestStatsGroupLatency(t *testing.T) {
+	ctx := context.Background()
+	sg := newStatsGroups()
+	for i := range 2 {
+		s := NewStats(ctx)
+		s.AddTransferDuration(time.Duration(i+1) * time.Second)
+		s.AddHeaderTime(time.Duration(i+1) * time.Millisecond)
+		sg.set(ctx, fmt.Sprint(i), s)
+	}
+	snapshot := sg.sum(ctx)
+	for range 2 {
+		sum := sg.sum(ctx)
+		ls, ok := sum.transferLatency()
+		require.True(t, ok)
+		assert.Equal(t, 2, ls.count)
+		assert.Equal(t, 1500*time.Millisecond, ls.average)
+		hs, ok := sum.headerLatency()
+		require.True(t, ok)
+		assert.Equal(t, 2, hs.count)
+		assert.Equal(t, 1500*time.Microsecond, hs.average)
+	}
+	sg.get("0").ResetCounters()
+	sg.get("1").AddTransferDuration(3 * time.Second)
+	ls, _ := sg.sum(ctx).transferLatency()
+	assert.Equal(t, 2, ls.count)
+	assert.Equal(t, 2500*time.Millisecond, ls.average)
+	old, _ := snapshot.transferLatency()
+	assert.Equal(t, 1500*time.Millisecond, old.average)
+}
+
 func TestCountError(t *testing.T) {
 	ctx := context.Background()
 	Start(ctx)

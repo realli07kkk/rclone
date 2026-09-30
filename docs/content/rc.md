@@ -1163,7 +1163,7 @@ Returns the following values:
 	"errors": number of errors,
 	"eta": estimated time in seconds until the group completes,
 	"fatalError": boolean whether there has been at least one fatal error,
-	"headerTimes": statistics (count, min, avg, max, p95, p99 in seconds) over the waits for response headers when opening the source of successful transfers,
+	"headerTimes": count and duration statistics (min, avg, max, p95, p99 in seconds) for the first successful source Open call of each successful transfer,
 	"lastError": last error string,
 	"renames" : number of files renamed,
 	"listed" : number of directory entries listed,
@@ -1177,7 +1177,7 @@ Returns the following values:
 	"totalChecks": total number of checks in the group,
 	"totalTransfers": total number of transfers in the group,
 	"transferTime" : total time spent on running jobs,
-	"transferTimes": statistics (count, min, avg, max, p95, p99 in seconds) over the durations of successful transfers,
+	"transferTimes": count and duration statistics (min, avg, max, p95, p99 in seconds) over successful transfers,
 	"transfers": number of transferred files,
 	"transferring": an array of currently active file transfers:
 		[
@@ -1197,6 +1197,16 @@ Returns the following values:
 ```
 Values for "transferring", "checking" and "lastError" are only assigned if data is available.
 The value for "eta" is null if an eta cannot be determined.
+
+The "transferTimes" and "headerTimes" fields are only returned when samples are available.
+Their count, min, avg and max include all recorded samples. The p95 and p99 values
+use a bounded histogram with 64 buckets per power of two. They are upper estimates
+of the nearest-rank percentiles, with relative error below 1.5625%.
+
+"headerTimes" measures the first successful source Open call, including retries
+inside that call, but excluding body transfer and subsequent reopens. For parallel
+reads it uses the first successfully opened chunk. Readers without source-open
+timing, such as pipes, and transfers without a source read do not contribute samples.
 
 **Authentication is not required for this call.**
 

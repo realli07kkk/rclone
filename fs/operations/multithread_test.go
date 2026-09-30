@@ -219,6 +219,11 @@ func TestMultithreadCopy(t *testing.T) {
 
 				defer func() {
 					tr.Done(ctx, err)
+					if err == nil {
+						stats, statsErr := accounting.GlobalStats().RemoteStats(false)
+						require.NoError(t, statsErr)
+						assert.Contains(t, stats, "headerTimes")
+					}
 				}()
 
 				dst, err = multiThreadCopy(ctx, fDst, fileName, src, test.streams, tr)

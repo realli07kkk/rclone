@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
+	"math/bits"
 	"slices"
 	"sort"
 	"strings"
@@ -344,38 +344,6 @@ type latencyStats struct {
 	p99     time.Duration
 }
 
-// newLatencyStats calculates latency stats for the durations using the
-// nearest-rank method for percentiles.
-//
-// Returns ok=false if durations is empty.
-func newLatencyStats(durations []time.Duration) (ls latencyStats, ok bool) {
-	if len(durations) == 0 {
-		return latencyStats{}, false
-	}
-	sorted := slices.Clone(durations)
-	slices.Sort(sorted)
-	var total time.Duration
-	for _, d := range sorted {
-		total += d
-	}
-	percentile := func(p float64) time.Duration {
-		// nearest-rank method: the ceil(p*n)-th smallest duration
-		i := int(math.Ceil(p*float64(len(sorted))/100)) - 1
-		if i < 0 {
-			i = 0
-		}
-		return sorted[i]
-	}
-	return latencyStats{
-		count:   len(sorted),
-		minimum: sorted[0],
-		average: total / time.Duration(len(sorted)),
-		maximum: sorted[len(sorted)-1],
-		p95:     percentile(95),
-		p99:     percentile(99),
-	}, true
-}
-
 // latencyString renders d for the latency stats line - durations below
 // 1ms would otherwise render as an empty string
 func latencyString(d time.Duration) string {
@@ -393,30 +361,94 @@ func (ls latencyStats) String() string {
 		latencyString(ls.p95), latencyString(ls.p99))
 }
 
-// durationStats collects durations and caches the latency statistics
-// calculated over them. Callers must hold the lock of the StatsInfo it
-// belongs to while accessing it.
+// durationStats 用最多 3712 个桶统计非负耗时；调用方必须持有所属 StatsInfo 的锁。
+// 每个二倍区间分成 64 个桶，分位数取桶上界，相对误差小于 1/64。
 type durationStats struct {
-	durations []time.Duration
-	cached    latencyStats // stats over durations, valid when computed == len(durations)
-	computed  int          // len(durations) when cached was calculated
+	buckets []uint64
+	count   int
+	minimum time.Duration
+	maximum time.Duration
+	totalHi uint64
+	totalLo uint64
 }
 
-// add records the duration d
+// 0..127ns 精确存储；之后每增加一位指数，增加 64 个桶。
+const durationBucketCount = 128 + (63-7)*64
+
+// add 记录耗时；负值不属于有效样本。
 func (ds *durationStats) add(d time.Duration) {
-	ds.durations = append(ds.durations, d)
+	if d < 0 {
+		return
+	}
+	shift := max(0, bits.Len64(uint64(d))-7)
+	i := shift*64 + int(uint64(d)>>shift)
+	if ds.buckets == nil {
+		ds.buckets = make([]uint64, durationBucketCount)
+	}
+	ds.buckets[i]++
+	if ds.count == 0 || d < ds.minimum {
+		ds.minimum = d
+	}
+	ds.maximum = max(ds.maximum, d)
+	ds.count++
+	// 总耗时可能超过 time.Duration 的范围，使用 128 位累加保持平均值精确。
+	var carry uint64
+	ds.totalLo, carry = bits.Add64(ds.totalLo, uint64(d), 0)
+	ds.totalHi, _ = bits.Add64(ds.totalHi, 0, carry)
 }
 
-// reset clears the collected durations and the cached statistics
+// reset 清空统计。
 func (ds *durationStats) reset() {
-	ds.durations = nil
-	ds.cached = latencyStats{}
-	ds.computed = 0
+	*ds = durationStats{}
 }
 
-// merge appends the durations collected in other
+// merge 合并全部样本的统计，空间和时间开销只取决于桶数。
 func (ds *durationStats) merge(other *durationStats) {
-	ds.durations = append(ds.durations, other.durations...)
+	if other.count == 0 {
+		return
+	}
+	if ds.buckets == nil {
+		ds.buckets = make([]uint64, durationBucketCount)
+	}
+	for i, n := range other.buckets {
+		ds.buckets[i] += n
+	}
+	if ds.count == 0 || other.minimum < ds.minimum {
+		ds.minimum = other.minimum
+	}
+	ds.maximum = max(ds.maximum, other.maximum)
+	ds.count += other.count
+	var carry uint64
+	ds.totalLo, carry = bits.Add64(ds.totalLo, other.totalLo, 0)
+	ds.totalHi, _ = bits.Add64(ds.totalHi, other.totalHi, carry)
+}
+
+// latency 返回全量统计；没有样本时 ok 为 false。
+func (ds *durationStats) latency() (ls latencyStats, ok bool) {
+	if ds.count == 0 {
+		return ls, false
+	}
+	average, _ := bits.Div64(ds.totalHi, ds.totalLo, uint64(ds.count))
+	ls = latencyStats{count: ds.count, minimum: ds.minimum, average: time.Duration(average), maximum: ds.maximum}
+	percentile := func(p uint64) time.Duration {
+		// nearest-rank 的整数形式，避免 count*p 溢出。
+		n := uint64(ds.count)
+		rank := n/100*p + (n%100*p+99)/100
+		for i, count := range ds.buckets {
+			if count < rank {
+				rank -= count
+				continue
+			}
+			upper := uint64(i)
+			if i >= 128 {
+				upper = (uint64(i%64+65) << (i/64 - 1)) - 1
+			}
+			return min(time.Duration(upper), ds.maximum)
+		}
+		return ds.maximum
+	}
+	ls.p95, ls.p99 = percentile(95), percentile(99)
+	return ls, true
 }
 
 // returned from calculateTransferStats
@@ -1003,10 +1035,21 @@ func (s *StatsInfo) NewTransferRemoteSize(remote string, size int64, srcFs, dstF
 //
 // if ok is true and it was in the transfermap (to avoid incrementing in case of nested calls, #6213) then it increments the transfers count
 func (s *StatsInfo) DoneTransferring(remote string, ok bool) {
+	s.doneTransferring(remote, ok, nil, nil)
+}
+
+// doneTransferring 使用同一个去重条件和锁更新计数及计时，避免与重置交错。
+func (s *StatsInfo) doneTransferring(remote string, ok bool, duration, headerWait *time.Duration) {
 	existed := s.transferring.del(remote)
 	if ok && existed {
 		s.mu.Lock()
 		s.transfers++
+		if duration != nil {
+			s.transferTimes.add(*duration)
+		}
+		if headerWait != nil {
+			s.headerTimes.add(*headerWait)
+		}
 		s.mu.Unlock()
 	}
 	if s.transferring.empty() && s.checking.empty() {
@@ -1045,30 +1088,11 @@ func (s *StatsInfo) headerLatency() (latencyStats, bool) {
 	return s.latencyOf(&s.headerTimes)
 }
 
-// latencyOf returns the cached latency stats over the durations
-// collected in ds, ok is false if there are none.
-//
-// The stats are cached and only recalculated when new durations were
-// recorded since the last call. The lock is released while calculating.
+// latencyOf 返回锁保护下的统计快照。
 func (s *StatsInfo) latencyOf(ds *durationStats) (latencyStats, bool) {
 	s.mu.RLock()
-	n := len(ds.durations)
-	if n == ds.computed {
-		cached := ds.cached
-		s.mu.RUnlock()
-		return cached, n > 0
-	}
-	durations := slices.Clone(ds.durations)
-	s.mu.RUnlock()
-
-	ls, ok := newLatencyStats(durations)
-
-	s.mu.Lock()
-	if len(ds.durations) == n {
-		ds.cached, ds.computed = ls, n
-	}
-	s.mu.Unlock()
-	return ls, ok
+	defer s.mu.RUnlock()
+	return ds.latency()
 }
 
 // SetCheckQueue sets the number of queued checks

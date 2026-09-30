@@ -1336,6 +1336,14 @@ type readCloser struct {
 	io.Closer
 }
 
+// OpenDuration 转发底层 source 的计时，避免范围读取丢失打开耗时。
+func (r readCloser) OpenDuration() (time.Duration, bool) {
+	if timer, ok := r.Closer.(interface{ OpenDuration() (time.Duration, bool) }); ok {
+		return timer.OpenDuration()
+	}
+	return 0, false
+}
+
 // Cat any files to the io.Writer
 //
 // if offset == 0 it will be ignored

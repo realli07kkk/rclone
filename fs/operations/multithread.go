@@ -59,6 +59,7 @@ type multiThreadCopyState struct {
 	size        int64
 	src         fs.Object
 	acc         *accounting.Account
+	tr          *accounting.Transfer
 	numChunks   int
 	noBuffering bool // set to read the input without buffering
 }
@@ -81,6 +82,9 @@ func (mc *multiThreadCopyState) copyChunk(ctx context.Context, chunk int, writer
 		return fmt.Errorf("multi-thread copy: failed to open source: %w", err)
 	}
 	defer fs.CheckClose(rc, &err)
+	if d, ok := rc.OpenDuration(); ok {
+		mc.tr.RecordOpenDuration(d)
+	}
 
 	var rs io.ReadSeeker
 	if mc.noBuffering {
@@ -207,6 +211,7 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		partSize:    info.ChunkSize,
 		numChunks:   numChunks,
 		noBuffering: noBuffering,
+		tr:          tr,
 	}
 
 	// Make accounting

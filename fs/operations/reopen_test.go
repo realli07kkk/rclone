@@ -5,9 +5,12 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/rclone/rclone/lib/pool"
 	"github.com/rclone/rclone/lib/readers"
@@ -23,6 +26,48 @@ var (
 )
 
 var errorTestError = errors.New("test error")
+
+type delayedOpenObject struct {
+	fs.Object
+	delay time.Duration
+}
+
+func (o delayedOpenObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	time.Sleep(o.delay)
+	return o.Object.Open(ctx, options...)
+}
+
+func TestReOpenDuration(t *testing.T) {
+	ctx := context.Background()
+	src := delayedOpenObject{
+		Object: mockobject.New("timed").WithContent([]byte("test"), mockobject.SeekModeNone),
+		delay:  5 * time.Millisecond,
+	}
+	in, err := Open(ctx, src)
+	require.NoError(t, err)
+	first, ok := in.OpenDuration()
+	require.True(t, ok)
+	assert.GreaterOrEqual(t, first, src.delay)
+	_, err = io.ReadAll(in)
+	require.NoError(t, err)
+	_, err = in.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	_, err = io.ReadAll(in)
+	require.NoError(t, err)
+	again, ok := in.OpenDuration()
+	require.True(t, ok)
+	assert.Equal(t, first, again)
+
+	// Transfer 在 Open 之后创建，范围包装也必须保留 source 的计时。
+	s := accounting.NewStats(ctx)
+	tr := s.NewTransfer(src, nil)
+	tr.Account(ctx, readCloser{Reader: io.LimitReader(in, 1), Closer: in})
+	tr.Done(ctx, nil)
+	stats, err := s.RemoteStats(false)
+	require.NoError(t, err)
+	require.Contains(t, stats, "headerTimes")
+	assert.Equal(t, first.Seconds(), stats["headerTimes"].(rc.Params)["min"])
+}
 
 // this is a wrapper for a mockobject with a custom Open function
 //

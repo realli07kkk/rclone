@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/asyncreader"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/log"
@@ -18,6 +19,8 @@ import (
 
 // parallel reads Object in chunks of a given size in parallel.
 type parallel struct {
+	accounting.OpenStats
+
 	ctx       context.Context
 	o         fs.Object  // source to read from
 	mu        sync.Mutex // protects following fields
@@ -77,6 +80,9 @@ func (s *stream) readFrom(ctx context.Context) {
 	if err != nil {
 		s.err <- fmt.Errorf("parallel chunked reader: failed to open stream at %d size %d: %w", s.offset, s.size, err)
 		return
+	}
+	if d, ok := rc.OpenDuration(); ok {
+		s.cr.RecordOpenDuration(d)
 	}
 	s.rc = rc
 
