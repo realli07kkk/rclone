@@ -12,7 +12,6 @@ import (
 	"io"
 	"path"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/rclone/rclone/fs"
@@ -351,20 +350,17 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 		retry = false
 		if fserrors.IsRetryError(err) || fserrors.ShouldRetry(err) {
 			retry = true
-		} else if t, ok := pacer.IsRetryAfter(err); ok {
+		} else if t, ok := pacer.IsRetryAfter(err); ok && tries+1 < c.maxTries {
 			fs.Debugf(c.src, "Sleeping for %v (as indicated by the server) to obey Retry-After error: %v", t, err)
-			if fs.HasTransferTimeout(ctx) {
-				if sleepErr := contextSleep(ctx, t); sleepErr != nil {
-					err = fs.TransferError(ctx, sleepErr)
-					break
-				}
+			if sleepWithContext(ctx, t) {
+				retry = true
 			} else {
-				time.Sleep(t)
+				fserrors.ContextError(ctx, &err)
+				err = fs.TransferError(ctx, err)
 			}
-			retry = true
 		}
 		if retry {
-			fs.Debugf(c.src, "Received error: %v - low level retry %d/%d", err, tries, c.maxTries)
+			fs.Debugf(c.src, "Received error: %v - low level retry %d/%d", err, tries+1, c.maxTries)
 			c.tr.Reset(ctx) // skip incomplete accounting - will be overwritten by retry
 			continue
 		}

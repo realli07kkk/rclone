@@ -997,6 +997,9 @@ func (s *StatsInfo) DoneChecking(remote string) {
 	s.checking.del(remote)
 	s.mu.Lock()
 	s.checks++
+	if s.transferring.empty() && s.checking.empty() {
+		s._stopAverageLoop()
+	}
 	s.mu.Unlock()
 }
 

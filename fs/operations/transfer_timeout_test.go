@@ -120,6 +120,39 @@ func TestTransferTimeoutRetryAfter(t *testing.T) {
 	assert.Equal(t, 1, calls)
 }
 
+type retryAfterOpenObject struct {
+	fs.Object
+	calls int
+}
+
+func (o *retryAfterOpenObject) Open(context.Context, ...fs.OpenOption) (io.ReadCloser, error) {
+	o.calls++
+	return nil, pacer.RetryAfterError(errors.New("rate limited"), time.Hour)
+}
+
+func TestCopyTransferTimeoutRetryAfter(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.TransferTimeout = fs.Duration(100 * time.Millisecond)
+	ci.LowLevelRetries = 100
+	ctx = accounting.WithStatsGroup(ctx, t.Name())
+	dst, err := fs.NewFs(ctx, ":memory:"+t.Name())
+	require.NoError(t, err)
+	dst.Features().Copy = nil
+	srcFs, err := mockfs.NewFs(ctx, "source", "", nil)
+	require.NoError(t, err)
+	src := mockobject.New("file").WithContent([]byte("data"), mockobject.SeekModeNone)
+	src.SetFs(srcFs)
+	source := &retryAfterOpenObject{Object: src}
+
+	_, err = operations.Copy(ctx, dst, nil, "file", source)
+	require.ErrorIs(t, err, fs.ErrorTransferTimeout)
+	assert.True(t, fserrors.IsNoRetryError(err))
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err))
+	assert.Equal(t, 1, source.calls)
+	assert.EqualValues(t, 1, accounting.Stats(ctx).GetErrors())
+	assert.Zero(t, accounting.Stats(ctx).GetTransfers())
+}
+
 func (o slowOpenObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	timer := time.NewTimer(o.delay)
 	defer timer.Stop()
